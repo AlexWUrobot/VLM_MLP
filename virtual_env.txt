@@ -1,0 +1,74 @@
+python3 -m venv vlm_mlp
+source vlm_mlp/bin/activate
+python -m pip install -U pip
+
+
+pip install torch torchvision transformers open_clip_torch pillow
+
+
+======================= image processing for training ========================
+
+
+/home/lifan/VLM_MLP/.venv/bin/python yolo_person_video.py --video Train/data_collector_video_20260407_185537.mp4
+
+
+/home/lifan/VLM_MLP/.venv/bin/python yolo_person_video_closest_save.py --video Train/data_collector_video_20260407_185537.mp4 --random-save 10
+
+
+/home/lifan/VLM_MLP/.venv/bin/python yolo_person_video_closest_save_crop.py --video data_collector_video_20260407_185537.mp4 --random-save 10 --random-outdir crop_frames
+
+
+/home/lifan/VLM_MLP/.venv/bin/python yolo_person_video_closest_save_crop_alltime.py --video data_collector_video_20260407_185537.mp4 --interval-ms 250 --outdir crop_frames --prefix come
+
+
+ /home/lifan/VLM_MLP/.venv/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'Train/come_*.mp4' --interval-ms 250 --outdir crop_frames
+
+ ++++++++++++++++++++++++++++++
+
+
+ Mac OS
+
+ cd ~/Documents/Data-proccessed
+
+python3 -m venv vlm_mlp
+source vlm_mlp/bin/activate
+python -m pip install -U pip
+
+
+pip install torch torchvision transformers open_clip_torch pillow ultralytics opencv-python
+
+
+======================= image processing for training ========================
+
+# Run using the venv's python (recommended)
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/come/*.mp4' --interval-ms 250 --outdir crop_frames
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/idle/*.mp4' --interval-ms 250 --outdir crop_frames
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/phone_call/*.mp4' --interval-ms 250 --outdir crop_frames
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/play_phone/*.mp4' --interval-ms 250 --outdir crop_frames
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/stop/*.mp4' --interval-ms 250 --outdir crop_frames
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/wave/*.mp4' --interval-ms 250 --outdir crop_frames
+
+
+
+# If you want all videos under raw/<action>/, use:
+./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/*/*.mp4' --interval-ms 250 --outdir crop_frames
+
+
+
+
+
+
+
+scp -r omr1@192.168.0.83:/Users/omr1/Documents/Data-proccessed/crop_frames/* /home/lifan/VLM_MLP/Data-proccessed/0...
+
+
+======================= CLIP-B -> MLP training ========================
+
+# Train an 8-class MLP using CLIP-B (ViT-B-32) features from Data-proccessed/
+/home/lifan/VLM_MLP/.venv/bin/python train_mlp_clip_b.py --data-dir Data-proccessed --epochs 20 --batch-size 64 --hidden 256
+
+# Predict for one image (prints number then label)
+/home/lifan/VLM_MLP/.venv/bin/python predict_mlp_clip_b.py --image Data-proccessed/come_0_533ms.jpg --ckpt mlp_clip_b.pt
+
+# Live
+/home/lifan/VLM_MLP/.venv/bin/python live_camera_predict_multiperson.py --ckpt mlp_clip_b.pt --camera 0
