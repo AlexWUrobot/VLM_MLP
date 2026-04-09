@@ -14,6 +14,15 @@ vlm_mlp/
 Data-proccessed/
 crop_frames*/
 random_frames*/
+Train/
+
+# Media
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+*.mkv
 
 # Model weights / caches
 *.pt
