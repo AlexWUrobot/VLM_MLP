@@ -1,0 +1,44 @@
+{
+  "labels_in_order": [
+    "come",
+    "idle_back",
+    "idle_front",
+    "none",
+    "phone",
+    "play_phone",
+    "stop",
+    "wave"
+  ],
+  "label_to_number": {
+    "come": 1,
+    "idle_back": 2,
+    "idle_front": 3,
+    "none": 4,
+    "phone": 5,
+    "play_phone": 6,
+    "stop": 7,
+    "wave": 8
+  },
+  "clip_model": "ViT-B-32",
+  "clip_pretrained": "openai",
+  "feature_dim": 512,
+  "hidden": 256,
+  "metrics": {
+    "train_acc": [
+      0.34581756373731104,
+      0.5441854150314641
+    ],
+    "val_acc": [
+      0.45080089569091797,
+      0.6258580684661865
+    ],
+    "train_loss": [
+      1.7284424149893163,
+      1.2381309285396482
+    ],
+    "val_loss": [
+      1.4510780572891235,
+      1.046336054801941
+    ]
+  }
+}
