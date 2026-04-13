@@ -27,7 +27,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera", type=int, default=0, help="Webcam index (default 0)")
     p.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
     p.add_argument("--yolo", default="yolov8n.pt", help="Ultralytics YOLO model for person detection")
-    p.add_argument("--yolo-conf", type=float, default=0.25, help="YOLO confidence threshold")
+    p.add_argument("--yolo-conf", type=float, default=0.9, help="YOLO confidence threshold")
+    p.add_argument(
+        "--yolo-iou",
+        type=float,
+        default=0.01,
+        help="YOLO NMS IoU threshold (lower = fewer duplicate boxes)",
+    )
     p.add_argument(
         "--max-people",
         type=int,
@@ -111,9 +117,17 @@ def _color_for_label_name(label_name: str) -> tuple[int, int, int]:
 MIN_DISPLAY_CONF = 0.65
 
 
-def get_person_boxes(frame_bgr, yolo_model, yolo_conf: float) -> list[tuple[int, int, int, int]]:
+def get_person_boxes(
+    frame_bgr, yolo_model, yolo_conf: float, yolo_iou: float
+) -> list[tuple[int, int, int, int]]:
     """Return a list of person bboxes (x1,y1,x2,y2) sorted by area desc."""
-    results = yolo_model.predict(frame_bgr, conf=yolo_conf, classes=[0], verbose=False)
+    results = yolo_model.predict(
+        frame_bgr,
+        conf=yolo_conf,
+        iou=float(yolo_iou),
+        classes=[0],
+        verbose=False,
+    )
     r = results[0]
     if getattr(r, "boxes", None) is None or len(r.boxes) == 0:
         return []
@@ -199,7 +213,7 @@ def main() -> None:
 
         frame_i += 1
 
-        boxes = get_person_boxes(frame, yolo, args.yolo_conf)
+        boxes = get_person_boxes(frame, yolo, args.yolo_conf, args.yolo_iou)
         boxes = boxes[: max(1, int(args.max_people))]
 
         stable_classes = _resize_list(stable_classes, len(boxes), None)
