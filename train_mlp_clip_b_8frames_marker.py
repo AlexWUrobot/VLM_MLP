@@ -179,8 +179,7 @@ def load_cache(cache_path: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
 
 POSE_DIM = 165
 HAND_DIM = 126
-MARKER_DIM = POSE_DIM + HAND_DIM
-MASK_DIM = MARKER_DIM
+HAND_MASK_DIM = HAND_DIM
 
 
 def _parse_floats(s: str) -> list[float]:
@@ -226,21 +225,36 @@ def load_pose_hand_from_txt(txt_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(pose_vals, dtype=np.float32), np.asarray(hand_vals, dtype=np.float32)
 
 
-def combine_clip_and_markers(
+def combine_clip_pose_hands_handmask(
     clip_feats: np.ndarray,
     pose: np.ndarray,
     hands: np.ndarray,
+    *,
+    w_clip: float,
+    w_pose: float,
+    w_hands: float,
+    w_hand_mask: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (combined_feats, missing_mask) for a single frame.
+    """Return (combined_feats, hand_missing_mask) for a single frame.
 
-    - Missing landmarks (NaN) are imputed with 0.
-    - Mask is 1 where value was missing, else 0.
+    Per-frame feature is:
+      clip(512) + pose(165) + hands(126) + hand_mask(126)
+
+    Missing values (NaN) are imputed with 0.
+    Mask is ONLY for hands (126 dims): 1 where hand value was missing, else 0.
+
+    We also apply per-block scaling weights to emphasize modalities.
     """
-    marker = np.concatenate([pose, hands], axis=0).astype(np.float32, copy=False)
-    mask = np.isnan(marker).astype(np.float32)
-    marker_imp = np.nan_to_num(marker, nan=0.0).astype(np.float32, copy=False)
-    combined = np.concatenate([clip_feats, marker_imp, mask], axis=0).astype(np.float32, copy=False)
-    return combined, mask
+    clip = clip_feats.astype(np.float32, copy=False) * float(w_clip)
+
+    pose_imp = np.nan_to_num(pose.astype(np.float32, copy=False), nan=0.0) * float(w_pose)
+
+    hand_mask = np.isnan(hands).astype(np.float32)
+    hands_imp = np.nan_to_num(hands.astype(np.float32, copy=False), nan=0.0) * float(w_hands)
+    hand_mask = hand_mask * float(w_hand_mask)
+
+    combined = np.concatenate([clip, pose_imp, hands_imp, hand_mask], axis=0).astype(np.float32, copy=False)
+    return combined, hand_mask
 
 
 def build_temporal_windows(
@@ -446,6 +460,12 @@ def main() -> None:
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
+
+    parser.add_argument("--w-clip", type=float, default=0.7)
+    parser.add_argument("--w-pose", type=float, default=0.1)
+    parser.add_argument("--w-hands", type=float, default=0.1)
+    parser.add_argument("--w-hand-mask", type=float, default=0.1)
+
     parser.add_argument("--out", default="mlp_clip_b_8frames_marker.pt", help="Output model checkpoint")
     args = parser.parse_args()
 
@@ -477,9 +497,14 @@ def main() -> None:
     if not marker_dir.exists():
         raise SystemExit(f"Marker dir not found: {marker_dir}")
 
-    # Build per-frame combined features: [clip(512), pose+hands(imputed), mask]
+    # Build per-frame combined features: clip + pose + hands + hand_mask
     combined_list: list[np.ndarray] = []
-    missing_any = 0
+    missing_hands_any = 0
+
+    w_clip = float(args.w_clip)
+    w_pose = float(args.w_pose)
+    w_hands = float(args.w_hands)
+    w_hand_mask = float(args.w_hand_mask)
 
     for i, p in enumerate(paths):
         img_path = Path(p)
@@ -492,19 +517,26 @@ def main() -> None:
         txt_path = (marker_dir / rel).with_suffix(".txt")
         pose, hands = load_pose_hand_from_txt(txt_path)
 
-        marker = np.concatenate([pose, hands], axis=0).astype(np.float32, copy=False)
-        if np.isnan(marker).any():
-            missing_any += 1
+        if np.isnan(hands).any():
+            missing_hands_any += 1
 
-        combined, _mask = combine_clip_and_markers(feats[i], pose, hands)
+        combined, _hand_mask = combine_clip_pose_hands_handmask(
+            feats[i],
+            pose,
+            hands,
+            w_clip=w_clip,
+            w_pose=w_pose,
+            w_hands=w_hands,
+            w_hand_mask=w_hand_mask,
+        )
         combined_list.append(combined)
 
     feats_combined = np.stack(combined_list, axis=0).astype(np.float32, copy=False)
     per_frame_dim = int(feats_combined.shape[1])
 
     print(
-        f"Per-frame dims: clip={clip_dim} pose={POSE_DIM} hands={HAND_DIM} mask={MASK_DIM} => {per_frame_dim} | "
-        f"frames_with_any_missing={missing_any}/{len(paths)}"
+        f"Per-frame dims: clip={clip_dim} pose={POSE_DIM} hands={HAND_DIM} hand_mask={HAND_MASK_DIM} => {per_frame_dim} | "
+        f"frames_with_any_missing_hands={missing_hands_any}/{len(paths)} | weights clip={w_clip} pose={w_pose} hands={w_hands} hand_mask={w_hand_mask}"
     )
 
     X, y, keys = build_temporal_windows(
@@ -545,13 +577,17 @@ def main() -> None:
         "clip_feature_dim": clip_dim,
         "pose_dim": int(POSE_DIM),
         "hand_dim": int(HAND_DIM),
-        "mask_dim": int(MASK_DIM),
+        "hand_mask_dim": int(HAND_MASK_DIM),
         "base_feature_dim": int(per_frame_dim),
         "feature_dim": int(X.shape[1]),
         "hidden": int(args.hidden),
         "num_frames": int(args.num_frames),
         "feat_agg": str(args.feat_agg),
         "stride": int(args.stride),
+        "w_clip": float(args.w_clip),
+        "w_pose": float(args.w_pose),
+        "w_hands": float(args.w_hands),
+        "w_hand_mask": float(args.w_hand_mask),
         "metrics": metrics,
     }
     torch.save(payload, out_path)
