@@ -40,8 +40,75 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Run prediction every N frames (increase to speed up).",
     )
+    p.add_argument(
+        "--inertia",
+        type=int,
+        default=3,
+        help="Change a label only after N consecutive predictions (default: 3). Use 1 to disable.",
+    )
     p.add_argument("--window", default="Live Prediction", help="OpenCV window name")
     return p.parse_args()
+
+
+def _resize_list(lst: list, n: int, fill):
+    if len(lst) >= n:
+        return lst[:n]
+    return lst + [fill] * (n - len(lst))
+
+
+def _apply_inertia(
+    raw_classes: list[int | None],
+    stable_classes: list[int | None],
+    pending_classes: list[int | None],
+    pending_counts: list[int],
+    inertia: int,
+) -> tuple[list[int | None], list[int | None], list[int]]:
+    k = len(raw_classes)
+    stable_classes = _resize_list(stable_classes, k, None)
+    pending_classes = _resize_list(pending_classes, k, None)
+    pending_counts = _resize_list(pending_counts, k, 0)
+
+    inertia = max(1, int(inertia))
+
+    for i in range(k):
+        raw = raw_classes[i]
+        if raw is None:
+            pending_classes[i] = None
+            pending_counts[i] = 0
+            continue
+
+        if stable_classes[i] is None:
+            stable_classes[i] = raw
+            pending_classes[i] = None
+            pending_counts[i] = 0
+            continue
+
+        if raw == stable_classes[i]:
+            pending_classes[i] = None
+            pending_counts[i] = 0
+            continue
+
+        if pending_classes[i] == raw:
+            pending_counts[i] += 1
+        else:
+            pending_classes[i] = raw
+            pending_counts[i] = 1
+
+        if pending_counts[i] >= inertia:
+            stable_classes[i] = raw
+            pending_classes[i] = None
+            pending_counts[i] = 0
+
+    return stable_classes, pending_classes, pending_counts
+
+
+def _color_for_label_name(label_name: str) -> tuple[int, int, int]:
+    # OpenCV uses BGR
+    alert = {"stop", "phone", "play_phone"}
+    return (0, 0, 255) if label_name.strip().lower() in alert else (0, 255, 0)
+
+
+MIN_DISPLAY_CONF = 0.85
 
 
 def get_person_boxes(frame_bgr, yolo_model, yolo_conf: float) -> list[tuple[int, int, int, int]]:
@@ -117,7 +184,10 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera index {args.camera}")
 
-    last_labels: list[str] = []
+    stable_classes: list[int | None] = []
+    stable_confs: list[float] = []
+    pending_classes: list[int | None] = []
+    pending_counts: list[int] = []
 
     frame_i = 0
     t0 = time.time()
@@ -132,33 +202,76 @@ def main() -> None:
         boxes = get_person_boxes(frame, yolo, args.yolo_conf)
         boxes = boxes[: max(1, int(args.max_people))]
 
+        stable_classes = _resize_list(stable_classes, len(boxes), None)
+        stable_confs = _resize_list(stable_confs, len(boxes), 0.0)
+        pending_classes = _resize_list(pending_classes, len(boxes), None)
+        pending_counts = _resize_list(pending_counts, len(boxes), 0)
+
         do_predict = frame_i % max(1, int(args.every)) == 0
         if do_predict:
             if boxes:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                crops = []
-                for (x1, y1, x2, y2) in boxes:
+                crops: list[Image.Image] = []
+                crop_to_box_i: list[int] = []
+                for box_i, (x1, y1, x2, y2) in enumerate(boxes):
                     crop_rgb = frame_rgb[y1:y2, x1:x2]
                     if crop_rgb.size == 0:
                         continue
                     crops.append(Image.fromarray(crop_rgb))
+
+                    crop_to_box_i.append(box_i)
+
+                raw_classes: list[int | None] = [None] * len(boxes)
+                raw_confs: list[float] = [0.0] * len(boxes)
 
                 if crops:
                     image_t = torch.stack([preprocess(im) for im in crops], dim=0).to(device)
                     feats = clip_model.encode_image(image_t).float()
                     feats = F.normalize(feats, dim=-1)
                     logits = mlp(feats)
-                    pred0s = logits.argmax(dim=1).tolist()
-                    last_labels = [f"{int(p) + 1} {labels[int(p)]}" for p in pred0s]
-                else:
-                    last_labels = []
+
+                    probs = torch.softmax(logits, dim=1)
+                    pred0s = probs.argmax(dim=1).tolist()
+                    top1_confs = probs.max(dim=1).values.tolist()
+
+                    for pred0, conf, box_i in zip(pred0s, top1_confs, crop_to_box_i, strict=False):
+                        raw_classes[box_i] = int(pred0)
+                        raw_confs[box_i] = float(conf)
+
+                stable_classes, pending_classes, pending_counts = _apply_inertia(
+                    raw_classes,
+                    stable_classes,
+                    pending_classes,
+                    pending_counts,
+                    args.inertia,
+                )
+
+                for i in range(len(boxes)):
+                    if stable_classes[i] is not None and stable_classes[i] == raw_classes[i]:
+                        stable_confs[i] = raw_confs[i]
             else:
-                last_labels = []
+                stable_classes = []
+                stable_confs = []
+                pending_classes = []
+                pending_counts = []
 
         # draw bboxes + labels (use current boxes, reuse last_labels when skipping prediction)
         for i, (x1, y1, x2, y2) in enumerate(boxes):
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            text = last_labels[i] if i < len(last_labels) else ""
+            cls = stable_classes[i] if i < len(stable_classes) else None
+            conf = stable_confs[i] if i < len(stable_confs) else 0.0
+            if cls is None:
+                text = ""
+                color = (0, 255, 0)
+            else:
+                if conf < MIN_DISPLAY_CONF:
+                    color = (160, 160, 160)
+                    text = f"{conf * 100.0:.0f}%"
+                else:
+                    label_name = str(labels[int(cls)])
+                    color = _color_for_label_name(label_name)
+                    text = f"{int(cls) + 1} {label_name} {conf * 100.0:.0f}%"
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             if text:
                 cv2.putText(
                     frame,
@@ -166,7 +279,7 @@ def main() -> None:
                     (x1, max(0, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
-                    (0, 255, 0),
+                    color,
                     2,
                     cv2.LINE_AA,
                 )

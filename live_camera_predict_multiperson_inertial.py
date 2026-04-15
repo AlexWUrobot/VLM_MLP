@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera", type=int, default=0, help="Webcam index (default 0)")
     p.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
     p.add_argument("--yolo", default="yolov8n.pt", help="Ultralytics YOLO model for person detection")
-    p.add_argument("--yolo-conf", type=float, default=0.9, help="YOLO confidence threshold")
+    p.add_argument("--yolo-conf", type=float, default=0.5, help="YOLO confidence threshold")
     p.add_argument(
         "--yolo-iou",
         type=float,
@@ -114,7 +114,7 @@ def _color_for_label_name(label_name: str) -> tuple[int, int, int]:
     return (0, 0, 255) if label_name.strip().lower() in alert else (0, 255, 0)
 
 
-MIN_DISPLAY_CONF = 0.65
+MIN_DISPLAY_CONF = 0.85
 
 
 def get_person_boxes(
