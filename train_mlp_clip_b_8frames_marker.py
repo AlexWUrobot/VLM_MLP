@@ -88,19 +88,97 @@ class ImageDataset(Dataset):
         return image, y, str(sample.path)
 
 
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, num_classes: int):
+class FusionTemporalMLP(nn.Module):
+    def __init__(
+        self,
+        *,
+        clip_dim: int,
+        pose_dim: int,
+        hand_dim: int,
+        hand_mask_dim: int,
+        proj_dim: int,
+        hidden: int,
+        num_classes: int,
+        num_frames: int,
+        feat_agg: str,
+    ):
         super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden)
+
+        self.clip_dim = int(clip_dim)
+        self.pose_dim = int(pose_dim)
+        self.hand_dim = int(hand_dim)
+        self.hand_mask_dim = int(hand_mask_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+
+        self.num_frames = max(1, int(num_frames))
+        self.feat_agg = str(feat_agg).lower().strip()
+        if self.feat_agg not in {"concat", "mean"}:
+            raise ValueError("feat_agg must be 'concat' or 'mean'")
+
+        self.proj_dim = int(proj_dim)
+
+        def _proj(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(int(in_dim), self.proj_dim),
+                nn.LayerNorm(self.proj_dim),
+                nn.ReLU(),
+            )
+
+        self.clip_proj = _proj(self.clip_dim)
+        self.pose_proj = _proj(self.pose_dim)
+        self.hand_proj = _proj(self.hand_dim)
+        self.hand_mask_proj = _proj(self.hand_mask_dim)
+
+        self.frame_embed_dim = self.proj_dim * 4
+
+        if self.feat_agg == "concat":
+            head_in = self.frame_embed_dim * self.num_frames
+        else:
+            head_in = self.frame_embed_dim
+
+        self.fc1 = nn.Linear(head_in, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.fc1(x))
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = F.relu(self.fc2(x))
-        x = F.dropout(x, p=0.2, training=self.training)
-        return self.fc3(x)
+        # x is either:
+        # - concat: (B, num_frames * per_frame_dim)
+        # - mean:   (B, per_frame_dim)
+        if self.feat_agg == "concat":
+            if x.shape[1] != self.num_frames * self.per_frame_dim:
+                raise RuntimeError(
+                    f"input dim mismatch: got {x.shape[1]} expected {self.num_frames * self.per_frame_dim}"
+                )
+            xf = x.view(x.shape[0], self.num_frames, self.per_frame_dim)
+        else:
+            if x.shape[1] != self.per_frame_dim:
+                raise RuntimeError(f"input dim mismatch: got {x.shape[1]} expected {self.per_frame_dim}")
+            xf = x.view(x.shape[0], 1, self.per_frame_dim)
+
+        clip = xf[:, :, : self.clip_dim]
+        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
+        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
+        hmask = xf[:, :, -self.hand_mask_dim :]
+
+        # project each block per frame
+        b, t, _ = xf.shape
+        clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
+        pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
+        hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
+        mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
+
+        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+
+        if self.feat_agg == "concat":
+            h = frame_e.reshape(b, t * self.frame_embed_dim)
+        else:
+            h = frame_e.mean(dim=1)
+
+        h = F.relu(self.fc1(h))
+        h = F.dropout(h, p=0.2, training=self.training)
+        h = F.relu(self.fc2(h))
+        h = F.dropout(h, p=0.2, training=self.training)
+        return self.fc3(h)
 
 
 def build_samples(data_dir: Path, exts: tuple[str, ...] = (".jpg", ".jpeg", ".png")) -> list[Sample]:
@@ -229,11 +307,6 @@ def combine_clip_pose_hands_handmask(
     clip_feats: np.ndarray,
     pose: np.ndarray,
     hands: np.ndarray,
-    *,
-    w_clip: float,
-    w_pose: float,
-    w_hands: float,
-    w_hand_mask: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (combined_feats, hand_missing_mask) for a single frame.
 
@@ -243,15 +316,13 @@ def combine_clip_pose_hands_handmask(
     Missing values (NaN) are imputed with 0.
     Mask is ONLY for hands (126 dims): 1 where hand value was missing, else 0.
 
-    We also apply per-block scaling weights to emphasize modalities.
+    No manual weighting here; the model learns per-block mixing.
     """
-    clip = clip_feats.astype(np.float32, copy=False) * float(w_clip)
-
-    pose_imp = np.nan_to_num(pose.astype(np.float32, copy=False), nan=0.0) * float(w_pose)
+    clip = clip_feats.astype(np.float32, copy=False)
+    pose_imp = np.nan_to_num(pose.astype(np.float32, copy=False), nan=0.0)
 
     hand_mask = np.isnan(hands).astype(np.float32)
-    hands_imp = np.nan_to_num(hands.astype(np.float32, copy=False), nan=0.0) * float(w_hands)
-    hand_mask = hand_mask * float(w_hand_mask)
+    hands_imp = np.nan_to_num(hands.astype(np.float32, copy=False), nan=0.0)
 
     combined = np.concatenate([clip, pose_imp, hands_imp, hand_mask], axis=0).astype(np.float32, copy=False)
     return combined, hand_mask
@@ -361,12 +432,20 @@ def train_mlp(
     x_val: np.ndarray,
     y_val: np.ndarray,
     device: str,
+    *,
+    clip_dim: int,
+    pose_dim: int,
+    hand_dim: int,
+    hand_mask_dim: int,
+    proj_dim: int,
+    num_frames: int,
+    feat_agg: str,
     hidden: int,
     lr: float,
     epochs: int,
     batch_size: int,
     seed: int,
-) -> tuple[MLP, dict]:
+) -> tuple[FusionTemporalMLP, dict]:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -375,7 +454,17 @@ def train_mlp(
     x_val_t = torch.from_numpy(x_val)
     y_val_t = torch.from_numpy(y_val)
 
-    model = MLP(in_dim=int(x_train.shape[1]), hidden=hidden, num_classes=len(LABELS_IN_ORDER)).to(device)
+    model = FusionTemporalMLP(
+        clip_dim=int(clip_dim),
+        pose_dim=int(pose_dim),
+        hand_dim=int(hand_dim),
+        hand_mask_dim=int(hand_mask_dim),
+        proj_dim=int(proj_dim),
+        hidden=hidden,
+        num_classes=len(LABELS_IN_ORDER),
+        num_frames=int(num_frames),
+        feat_agg=str(feat_agg),
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
     def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
@@ -458,13 +547,9 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--proj-dim", type=int, default=128, help="Per-block projection dim")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
-
-    parser.add_argument("--w-clip", type=float, default=0.7)
-    parser.add_argument("--w-pose", type=float, default=0.1)
-    parser.add_argument("--w-hands", type=float, default=0.1)
-    parser.add_argument("--w-hand-mask", type=float, default=0.1)
 
     parser.add_argument("--out", default="mlp_clip_b_8frames_marker.pt", help="Output model checkpoint")
     args = parser.parse_args()
@@ -501,10 +586,6 @@ def main() -> None:
     combined_list: list[np.ndarray] = []
     missing_hands_any = 0
 
-    w_clip = float(args.w_clip)
-    w_pose = float(args.w_pose)
-    w_hands = float(args.w_hands)
-    w_hand_mask = float(args.w_hand_mask)
 
     for i, p in enumerate(paths):
         img_path = Path(p)
@@ -520,15 +601,7 @@ def main() -> None:
         if np.isnan(hands).any():
             missing_hands_any += 1
 
-        combined, _hand_mask = combine_clip_pose_hands_handmask(
-            feats[i],
-            pose,
-            hands,
-            w_clip=w_clip,
-            w_pose=w_pose,
-            w_hands=w_hands,
-            w_hand_mask=w_hand_mask,
-        )
+        combined, _hand_mask = combine_clip_pose_hands_handmask(feats[i], pose, hands)
         combined_list.append(combined)
 
     feats_combined = np.stack(combined_list, axis=0).astype(np.float32, copy=False)
@@ -536,7 +609,7 @@ def main() -> None:
 
     print(
         f"Per-frame dims: clip={clip_dim} pose={POSE_DIM} hands={HAND_DIM} hand_mask={HAND_MASK_DIM} => {per_frame_dim} | "
-        f"frames_with_any_missing_hands={missing_hands_any}/{len(paths)} | weights clip={w_clip} pose={w_pose} hands={w_hands} hand_mask={w_hand_mask}"
+        f"frames_with_any_missing_hands={missing_hands_any}/{len(paths)}"
     )
 
     X, y, keys = build_temporal_windows(
@@ -560,6 +633,13 @@ def main() -> None:
         x_val=x_val,
         y_val=y_val,
         device=device,
+        clip_dim=clip_dim,
+        pose_dim=POSE_DIM,
+        hand_dim=HAND_DIM,
+        hand_mask_dim=HAND_MASK_DIM,
+        proj_dim=args.proj_dim,
+        num_frames=args.num_frames,
+        feat_agg=args.feat_agg,
         hidden=args.hidden,
         lr=args.lr,
         epochs=args.epochs,
@@ -578,16 +658,14 @@ def main() -> None:
         "pose_dim": int(POSE_DIM),
         "hand_dim": int(HAND_DIM),
         "hand_mask_dim": int(HAND_MASK_DIM),
+        "model_type": "fusion_temporal_mlp",
         "base_feature_dim": int(per_frame_dim),
         "feature_dim": int(X.shape[1]),
         "hidden": int(args.hidden),
+        "proj_dim": int(args.proj_dim),
         "num_frames": int(args.num_frames),
         "feat_agg": str(args.feat_agg),
         "stride": int(args.stride),
-        "w_clip": float(args.w_clip),
-        "w_pose": float(args.w_pose),
-        "w_hands": float(args.w_hands),
-        "w_hand_mask": float(args.w_hand_mask),
         "metrics": metrics,
     }
     torch.save(payload, out_path)

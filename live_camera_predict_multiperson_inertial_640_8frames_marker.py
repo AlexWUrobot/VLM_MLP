@@ -13,17 +13,91 @@ import torch.nn.functional as F
 from PIL import Image
 
 
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, num_classes: int):
+class FusionTemporalMLP(nn.Module):
+    def __init__(
+        self,
+        *,
+        clip_dim: int,
+        pose_dim: int,
+        hand_dim: int,
+        hand_mask_dim: int,
+        proj_dim: int,
+        hidden: int,
+        num_classes: int,
+        num_frames: int,
+        feat_agg: str,
+    ):
         super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden)
+
+        self.clip_dim = int(clip_dim)
+        self.pose_dim = int(pose_dim)
+        self.hand_dim = int(hand_dim)
+        self.hand_mask_dim = int(hand_mask_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+
+        self.num_frames = max(1, int(num_frames))
+        self.feat_agg = str(feat_agg).lower().strip()
+        if self.feat_agg not in {"concat", "mean"}:
+            raise ValueError("feat_agg must be 'concat' or 'mean'")
+
+        self.proj_dim = int(proj_dim)
+
+        def _proj(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(int(in_dim), self.proj_dim),
+                nn.LayerNorm(self.proj_dim),
+                nn.ReLU(),
+            )
+
+        self.clip_proj = _proj(self.clip_dim)
+        self.pose_proj = _proj(self.pose_dim)
+        self.hand_proj = _proj(self.hand_dim)
+        self.hand_mask_proj = _proj(self.hand_mask_dim)
+
+        self.frame_embed_dim = self.proj_dim * 4
+
+        if self.feat_agg == "concat":
+            head_in = self.frame_embed_dim * self.num_frames
+        else:
+            head_in = self.frame_embed_dim
+
+        self.fc1 = nn.Linear(head_in, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        if self.feat_agg == "concat":
+            if x.shape[1] != self.num_frames * self.per_frame_dim:
+                raise RuntimeError(
+                    f"input dim mismatch: got {x.shape[1]} expected {self.num_frames * self.per_frame_dim}"
+                )
+            xf = x.view(x.shape[0], self.num_frames, self.per_frame_dim)
+        else:
+            if x.shape[1] != self.per_frame_dim:
+                raise RuntimeError(f"input dim mismatch: got {x.shape[1]} expected {self.per_frame_dim}")
+            xf = x.view(x.shape[0], 1, self.per_frame_dim)
+
+        clip = xf[:, :, : self.clip_dim]
+        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
+        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
+        hmask = xf[:, :, -self.hand_mask_dim :]
+
+        b, t, _ = xf.shape
+        clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
+        pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
+        hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
+        mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
+
+        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+
+        if self.feat_agg == "concat":
+            h = frame_e.reshape(b, t * self.frame_embed_dim)
+        else:
+            h = frame_e.mean(dim=1)
+
+        h = F.relu(self.fc1(h))
+        h = F.relu(self.fc2(h))
+        return self.fc3(h)
 
 
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
@@ -34,7 +108,7 @@ HAND_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landma
 
 POSE_DIM = 165
 HAND_DIM = 126
-MASK_DIM = POSE_DIM + HAND_DIM
+HAND_MASK_DIM = HAND_DIM
 
 
 def ensure_model(*, model_url: str, model_path: str, label: str) -> None:
@@ -137,12 +211,19 @@ def combine_frame_features(
     pose_vec: list[float],
     hand_vec: list[float],
 ) -> torch.Tensor:
-    marker = torch.tensor(pose_vec + hand_vec, dtype=torch.float32)
-    mask = torch.isnan(marker).to(torch.float32)
-    marker = torch.nan_to_num(marker, nan=0.0)
+    # pose: impute NaN -> 0 (no mask)
+    pose_t = torch.tensor(pose_vec, dtype=torch.float32)
+    pose_t = torch.nan_to_num(pose_t, nan=0.0)
 
-    # [clip(512), pose+hands(imputed), mask]
-    return torch.cat([clip_feat.to(torch.float32), marker, mask], dim=0)
+    # hands: impute NaN -> 0 + mask only for hands
+    hands_t = torch.tensor(hand_vec, dtype=torch.float32)
+    hand_mask_t = torch.isnan(hands_t).to(torch.float32)
+    hands_t = torch.nan_to_num(hands_t, nan=0.0)
+
+    clip_t = clip_feat.to(torch.float32)
+
+    # [clip(512), pose(165), hands(126), hand_mask(126)]
+    return torch.cat([clip_t, pose_t, hands_t, hand_mask_t], dim=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -387,13 +468,24 @@ def main() -> None:
     labels = payload["labels_in_order"]
     feature_dim = int(payload["feature_dim"])
     hidden = int(payload["hidden"])
+    proj_dim = int(payload.get("proj_dim", 128))
 
     num_frames = int(payload.get("num_frames", 1))
     feat_agg = str(payload.get("feat_agg", "concat")).lower().strip()
     if feat_agg not in {"concat", "mean"}:
         feat_agg = "concat"
 
-    mlp = MLP(in_dim=feature_dim, hidden=hidden, num_classes=len(labels)).to(device)
+    mlp = FusionTemporalMLP(
+        clip_dim=int(payload.get("clip_feature_dim", 512)),
+        pose_dim=int(payload.get("pose_dim", POSE_DIM)),
+        hand_dim=int(payload.get("hand_dim", HAND_DIM)),
+        hand_mask_dim=int(payload.get("hand_mask_dim", HAND_MASK_DIM)),
+        proj_dim=proj_dim,
+        hidden=hidden,
+        num_classes=len(labels),
+        num_frames=int(payload.get("num_frames", 8)),
+        feat_agg=str(payload.get("feat_agg", "concat")),
+    ).to(device)
     mlp.load_state_dict(payload["state_dict"], strict=True)
     mlp.eval()
 
@@ -408,11 +500,12 @@ def main() -> None:
     expected_total_dim = int(payload.get("feature_dim", feature_dim))
     clip_dim_expected = int(payload.get("clip_feature_dim", 512))
 
+
     if clip_dim_expected != 512:
         print(f"[warn] clip_feature_dim in ckpt is {clip_dim_expected} (expected 512)")
 
     if expected_per_frame_dim:
-        implied = clip_dim_expected + (POSE_DIM + HAND_DIM) + MASK_DIM
+        implied = clip_dim_expected + POSE_DIM + HAND_DIM + HAND_MASK_DIM
         if implied != expected_per_frame_dim:
             raise SystemExit(
                 f"Checkpoint base_feature_dim mismatch: ckpt={expected_per_frame_dim} implied={implied}"
@@ -546,7 +639,11 @@ def main() -> None:
                             else:
                                 hand_vec = hand_vector_two_hands([])
 
-                            combined = combine_frame_features(frame_clip[j].detach().cpu(), pose_vec, hand_vec)
+                            combined = combine_frame_features(
+                                frame_clip[j].detach().cpu(),
+                                pose_vec,
+                                hand_vec,
+                            )
                             if expected_per_frame_dim and combined.numel() != expected_per_frame_dim:
                                 raise SystemExit(
                                     f"per-frame feature dim mismatch: got {combined.numel()} expected {expected_per_frame_dim}"
