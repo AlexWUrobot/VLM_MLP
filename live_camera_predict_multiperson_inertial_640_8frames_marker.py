@@ -738,26 +738,32 @@ def main() -> None:
             dt = time.time() - t0
             fps = frame_i / dt if dt > 0 else 0.0
 
-            cv2.putText(
-                frame,
-                f"people: {len(boxes)}  every: {max(1, int(args.every))}  inertia: {max(1, int(args.inertia))}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame,
+            # HUD (left column): small yellow text
+            hud_color = (0, 255, 255)  # BGR yellow
+            hud_scale = 0.6
+            hud_thick = 2
+            x0 = 10
+            y0 = 25
+            dy = 20
+
+            hud_lines = [
+                f"people: {len(boxes)}",
+                f"every: {max(1, int(args.every))}",
+                f"inertia: {max(1, int(args.inertia))}",
                 f"fps: {fps:.1f}",
-                (10, 65),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            ]
+
+            for li, s in enumerate(hud_lines):
+                cv2.putText(
+                    frame,
+                    s,
+                    (x0, y0 + li * dy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    hud_scale,
+                    hud_color,
+                    hud_thick,
+                    cv2.LINE_AA,
+                )
 
             cv2.imshow(args.window, frame)
             key = cv2.waitKey(1) & 0xFF

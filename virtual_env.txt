@@ -72,3 +72,33 @@ scp -r omr1@192.168.0.83:/Users/omr1/Documents/Data-proccessed/crop_frames/* /ho
 
 # Live
 /home/lifan/VLM_MLP/.venv/bin/python live_camera_predict_multiperson.py --ckpt mlp_clip_b.pt --camera 0
+--------------------------------------------------------------------------------------------------------
+
+# Live 640
+/home/lifan/VLM_MLP/.venv/bin/python live_camera_predict_multiperson_inertial_640.py --ckpt mlp_clip_b.pt --camera 1 --yolo yolov8m.pt
+                    .venv/bin/python live_camera_predict_multiperson_inertial_640_8frames.py --camera 1 --yolo yolov8m.pt
+
+# Auto Weight training
+.venv/bin/python train_mlp_clip_b_8frames_marker.py --data-dir Data-proccessed --marker-dir Data-processed-landmarker --cache clip_b_features.npz --out mlp_clip_b_8frames_marker.pt --num-frames 8 --feat-agg concat --stride 1 --proj-dim 128
+
+
+# With marker
+                    .venv/bin/python live_camera_predict_multiperson_inertial_640_8frames_marker.py --camera 1 --yolo yolov8m.pt
+
+
+
+# Train 2 frames
+.venv/bin/python train_mlp_clip_b_8frames_marker.py \
+  --num-frames 2 --feat-agg concat --stride 1 \
+  --out mlp_clip_b_2frames_marker.pt
+
+
+# Predict
+.venv/bin/python live_camera_predict_multiperson_inertial_640_8frames_marker.py \
+  --ckpt mlp_clip_b_2frames_marker.pt --camera 1 --yolo yolov8m.pt
+
+
+# Predict 1 intertial
+
+.venv/bin/python live_camera_predict_multiperson_inertial_640_8frames_marker.py \
+  --ckpt mlp_clip_b_2frames_marker.pt --camera 1 --yolo yolov8m.pt --inertia 1
