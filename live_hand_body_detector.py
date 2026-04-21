@@ -10,6 +10,7 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core import base_options
+from ultralytics import YOLO
 
 
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
@@ -251,6 +252,85 @@ def _draw_normalized_landmarks_skeleton(
         cv2.line(frame_bgr, pa, pb, color, int(thickness), lineType=cv2.LINE_AA)
 
 
+def _draw_landmarks_points_in_roi(
+    frame_bgr,
+    landmarks: Sequence,
+    roi_xyxy: Tuple[int, int, int, int],
+    color: Tuple[int, int, int],
+    radius: int = 2,
+) -> None:
+    x1, y1, x2, y2 = roi_xyxy
+    roi_w = max(1, x2 - x1)
+    roi_h = max(1, y2 - y1)
+    for lm in landmarks:
+        x = x1 + int(float(getattr(lm, "x", -1.0)) * roi_w)
+        y = y1 + int(float(getattr(lm, "y", -1.0)) * roi_h)
+        if x1 <= x < x2 and y1 <= y < y2:
+            cv2.circle(frame_bgr, (x, y), int(radius), color, -1)
+
+
+def _draw_landmarks_skeleton_in_roi(
+    frame_bgr,
+    landmarks: Sequence,
+    connections: Sequence[Tuple[int, int]],
+    roi_xyxy: Tuple[int, int, int, int],
+    color: Tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    x1, y1, x2, y2 = roi_xyxy
+    roi_w = max(1, x2 - x1)
+    roi_h = max(1, y2 - y1)
+
+    pts: List[Optional[Tuple[int, int]]] = []
+    for lm in landmarks:
+        x = x1 + int(float(getattr(lm, "x", -1.0)) * roi_w)
+        y = y1 + int(float(getattr(lm, "y", -1.0)) * roi_h)
+        if x1 <= x < x2 and y1 <= y < y2:
+            pts.append((x, y))
+        else:
+            pts.append(None)
+
+    for a, b in connections:
+        if a < 0 or b < 0 or a >= len(pts) or b >= len(pts):
+            continue
+        pa = pts[a]
+        pb = pts[b]
+        if pa is None or pb is None:
+            continue
+        cv2.line(frame_bgr, pa, pb, color, int(thickness), lineType=cv2.LINE_AA)
+
+
+def _expand_and_clip_xyxy(
+    xyxy: Tuple[float, float, float, float],
+    pad: float,
+    w: int,
+    h: int,
+) -> Tuple[int, int, int, int]:
+    x1f, y1f, x2f, y2f = xyxy
+    bw = max(1.0, x2f - x1f)
+    bh = max(1.0, y2f - y1f)
+    x1 = int(np.floor(x1f - pad * bw))
+    y1 = int(np.floor(y1f - pad * bh))
+    x2 = int(np.ceil(x2f + pad * bw))
+    y2 = int(np.ceil(y2f + pad * bh))
+    x1 = int(np.clip(x1, 0, w - 1))
+    y1 = int(np.clip(y1, 0, h - 1))
+    x2 = int(np.clip(x2, x1 + 1, w))
+    y2 = int(np.clip(y2, y1 + 1, h))
+    return x1, y1, x2, y2
+
+
+def _probe_camera_indices(max_index: int = 10) -> List[int]:
+    opened: List[int] = []
+    for i in range(int(max_index)):
+        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
+        ok = cap.isOpened()
+        cap.release()
+        if ok:
+            opened.append(i)
+    return opened
+
+
 def _hand_side_from_handedness(handedness_list: Optional[Sequence], i: int) -> Optional[str]:
     if not handedness_list or i >= len(handedness_list) or not handedness_list[i]:
         return None
@@ -331,6 +411,35 @@ def parse_args() -> argparse.Namespace:
         default=0.6,
         help="Minimum hand detection confidence",
     )
+    p.add_argument(
+        "--yolo-model",
+        default="yolov8n.pt",
+        help="YOLO model path/name for person detection (e.g. yolov8n.pt)",
+    )
+    p.add_argument(
+        "--yolo-conf",
+        type=float,
+        default=0.35,
+        help="YOLO confidence threshold for person detection",
+    )
+    p.add_argument(
+        "--yolo-iou",
+        type=float,
+        default=0.5,
+        help="YOLO IoU threshold for tracking",
+    )
+    p.add_argument(
+        "--max-people",
+        type=int,
+        default=6,
+        help="Max number of tracked people to run landmarking on per frame",
+    )
+    p.add_argument(
+        "--crop-pad",
+        type=float,
+        default=0.2,
+        help="Padding ratio around YOLO box before landmarking (e.g. 0.2 = 20%%)",
+    )
     return p.parse_args()
 
 
@@ -354,9 +463,15 @@ def main() -> int:
         min_hand_detection_confidence=float(args.hand_conf),
     )
 
-    cap = cv2.VideoCapture(int(args.camera_index))
+    # YOLO person detector + tracker
+    yolo = YOLO(str(args.yolo_model))
+
+    # On Linux, prefer V4L2 backend to avoid other camera backends misinterpreting indices.
+    cap = cv2.VideoCapture(int(args.camera_index), cv2.CAP_V4L2)
     if not cap.isOpened():
-        raise RuntimeError(f"Failed to open camera index {args.camera_index}")
+        opened = _probe_camera_indices(10)
+        hint = f". OpenCV can open indices: {opened}" if opened else ". No openable indices found (0..9)."
+        raise RuntimeError(f"Failed to open camera index {args.camera_index}{hint}")
 
     if int(args.width) > 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(args.width))
@@ -383,48 +498,106 @@ def main() -> int:
             if args.flip:
                 frame_bgr = cv2.flip(frame_bgr, 1)
 
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
             # MediaPipe Tasks VIDEO mode requires a timestamp in ms.
             timestamp_ms = int((time.monotonic() - start_time_s) * 1000.0)
-            pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-            hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-
             annotated = frame_bgr.copy()
 
-            # Pose skeleton (green)
-            if pose_result.pose_landmarks:
-                for pose_lms in pose_result.pose_landmarks:
-                    _draw_normalized_landmarks_skeleton(
-                        annotated,
-                        pose_lms,
-                        POSE_CONNECTIONS,
-                        body_green,
-                        thickness=2,
-                    )
-                    _draw_normalized_landmarks_points(annotated, pose_lms, body_green, radius=2)
+            # YOLO tracking (class 0 = person). We use tracking IDs to keep people stable.
+            yolo_results = yolo.track(
+                source=frame_bgr,
+                persist=True,
+                classes=[0],
+                conf=float(args.yolo_conf),
+                iou=float(args.yolo_iou),
+                verbose=False,
+            )
 
-            # Hands skeletons (Right=blue, Left=red)
-            if hand_result.hand_landmarks:
-                for i, hand_lms in enumerate(hand_result.hand_landmarks):
-                    side = _hand_side_from_handedness(hand_result.handedness, i)
-                    if side == "Right":
-                        color = right_blue
-                    elif side == "Left":
-                        color = left_red
-                    else:
-                        # If handedness is missing/unknown, draw in yellow.
-                        color = (0, 255, 255)
+            if yolo_results and len(yolo_results) > 0 and getattr(yolo_results[0], "boxes", None) is not None:
+                boxes = yolo_results[0].boxes
 
-                    _draw_normalized_landmarks_skeleton(
+                # Sort by box area (largest first) so we spend compute on prominent people.
+                xyxy = boxes.xyxy.cpu().numpy() if boxes.xyxy is not None else np.zeros((0, 4), dtype=np.float32)
+                confs = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else np.zeros((len(xyxy),), dtype=np.float32)
+                ids = (
+                    boxes.id.cpu().numpy().astype(int)
+                    if getattr(boxes, "id", None) is not None and boxes.id is not None
+                    else -np.ones((len(xyxy),), dtype=int)
+                )
+
+                areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1]) if len(xyxy) else np.zeros((0,))
+                order = np.argsort(-areas)
+                if int(args.max_people) > 0:
+                    order = order[: int(args.max_people)]
+
+                H, W = frame_bgr.shape[:2]
+                for j, idx in enumerate(order.tolist()):
+                    x1f, y1f, x2f, y2f = [float(v) for v in xyxy[idx].tolist()]
+                    roi = _expand_and_clip_xyxy((x1f, y1f, x2f, y2f), float(args.crop_pad), W, H)
+                    x1, y1, x2, y2 = roi
+                    if x2 - x1 < 5 or y2 - y1 < 5:
+                        continue
+
+                    # Draw bbox + ID
+                    track_id = int(ids[idx])
+                    score = float(confs[idx])
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                    label = f"ID {track_id} {score:.2f}" if track_id >= 0 else f"person {score:.2f}"
+                    cv2.putText(
                         annotated,
-                        hand_lms,
-                        HAND_CONNECTIONS,
-                        color,
-                        thickness=2,
+                        label,
+                        (x1, max(0, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                        lineType=cv2.LINE_AA,
                     )
-                    _draw_normalized_landmarks_points(annotated, hand_lms, color, radius=2)
+
+                    crop_bgr = frame_bgr[y1:y2, x1:x2]
+                    if crop_bgr.size == 0:
+                        continue
+
+                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                    crop_mp = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+
+                    # Keep timestamps monotonic even when calling multiple times per frame.
+                    ts = int(timestamp_ms + j)
+                    pose_result = pose_landmarker.detect_for_video(crop_mp, ts)
+                    hand_result = hand_landmarker.detect_for_video(crop_mp, ts)
+
+                    # Pose skeleton (green) in ROI
+                    if pose_result.pose_landmarks:
+                        for pose_lms in pose_result.pose_landmarks:
+                            _draw_landmarks_skeleton_in_roi(
+                                annotated,
+                                pose_lms,
+                                POSE_CONNECTIONS,
+                                roi,
+                                body_green,
+                                thickness=2,
+                            )
+                            _draw_landmarks_points_in_roi(annotated, pose_lms, roi, body_green, radius=2)
+
+                    # Hands skeletons (Right=blue, Left=red) in ROI
+                    if hand_result.hand_landmarks:
+                        for i, hand_lms in enumerate(hand_result.hand_landmarks):
+                            side = _hand_side_from_handedness(hand_result.handedness, i)
+                            if side == "Right":
+                                color = right_blue
+                            elif side == "Left":
+                                color = left_red
+                            else:
+                                color = (0, 255, 255)
+
+                            _draw_landmarks_skeleton_in_roi(
+                                annotated,
+                                hand_lms,
+                                HAND_CONNECTIONS,
+                                roi,
+                                color,
+                                thickness=2,
+                            )
+                            _draw_landmarks_points_in_roi(annotated, hand_lms, roi, color, radius=2)
 
             # FPS overlay
             t1 = cv2.getTickCount()
