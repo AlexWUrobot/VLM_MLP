@@ -316,12 +316,15 @@ def train_mlp(
     model = MLP(in_dim=int(x_train.shape[1]), hidden=hidden, num_classes=len(LABELS_IN_ORDER)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
-    # Inverse-frequency class weights so rare classes (e.g. "come") get boosted
+    # Sqrt-inverse-frequency class weights: boosts rare classes (come) without
+    # crushing well-represented ones (phone).  Raw inverse-frequency was too
+    # aggressive and degraded phone detection.
     class_counts = np.bincount(y_train, minlength=len(LABELS_IN_ORDER)).astype(np.float64)
     class_counts = np.maximum(class_counts, 1.0)
-    inv_freq = 1.0 / class_counts
+    inv_freq = 1.0 / np.sqrt(class_counts)
     class_weights = torch.tensor(inv_freq / inv_freq.sum() * len(LABELS_IN_ORDER), dtype=torch.float32).to(device)
-    print(f"[class weights] {dict(zip(LABELS_IN_ORDER, class_weights.tolist()))}")
+    print(f"[class weights] {dict(zip(LABELS_IN_ORDER, [f'{w:.3f}' for w in class_weights.tolist()]))}")
+    print(f"[class counts ] {dict(zip(LABELS_IN_ORDER, [int(c) for c in class_counts.tolist()]))}")
 
     def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
         pred = logits.argmax(dim=1)

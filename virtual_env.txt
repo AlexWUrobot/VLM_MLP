@@ -149,3 +149,20 @@ python3 train_mlp_clip_b_3frames.py \
 
   python3 live_camera_predict_multiperson_inertial_640_3frames.py \
   --ckpt mlp_clip_b_6class_3frames.pt --camera 4 --yolo yolo11m.pt
+
+------------------------------------------------------
+
+  python3 train_mlp_clip_b_3frames.py \
+  --num-frames 8 --epochs 30 --no-cache \
+  --out mlp_clip_b_6class_diffs.pt
+
+
+------------------------------------------------------  
+Changed 1/count to 1/sqrt(count) for class weighting.
+------------------------------------------------------
+python3 train_mlp_clip_b_3frames.py \
+  --num-frames 8 --epochs 30 --hidden 512 --no-cache \
+  --out mlp_clip_b_6class_diffs.pt
+
+  python3 live_camera_predict_multiperson_inertial_640_3frames.py \
+  --ckpt mlp_clip_b_6class_diffs.pt --camera 4 --yolo yolo11m.pt
