@@ -136,3 +136,16 @@ python3 live_camera_predict_marker.py --ckpt gru_8frames_marker.pt
  --camera 4 --yolo yolov8m.pt
 
 python3 live_camera_predict_marker.py --ckpt gru_8frames_marker.pt  --camera 4 --yolo yolo11m.pt
+
+
+-----------------  3 frames --------------------
+
+
+python3 train_mlp_clip_b_3frames.py \
+  --num-frames 8 --epochs 30 --no-cache \
+  --out mlp_clip_b_6class_3frames.pt
+
+
+
+  python3 live_camera_predict_multiperson_inertial_640_3frames.py \
+  --ckpt mlp_clip_b_6class_3frames.pt --camera 4 --yolo yolo11m.pt
