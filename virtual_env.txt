@@ -78,6 +78,14 @@ scp -r omr1@192.168.0.83:/Users/omr1/Documents/Data-proccessed/crop_frames/* /ho
 /home/lifan/VLM_MLP/.venv/bin/python live_camera_predict_multiperson_inertial_640.py --ckpt mlp_clip_b.pt --camera 1 --yolo yolov8m.pt
                     .venv/bin/python live_camera_predict_multiperson_inertial_640_8frames.py --camera 1 --yolo yolov8m.pt
 
+
+
+--------------------------------------------------------------------------------------------------------
+# label data with skeleton of body and hand 
+.venv/bin/python hand_body_detector.py --in-dir Data-proccessed --out-dir Data-processed-landmarker
+
+
+
 # Auto Weight training
 .venv/bin/python train_mlp_clip_b_8frames_marker.py --data-dir Data-proccessed --marker-dir Data-processed-landmarker --cache clip_b_features.npz --out mlp_clip_b_8frames_marker.pt --num-frames 8 --feat-agg concat --stride 1 --proj-dim 128
 
@@ -102,3 +110,29 @@ scp -r omr1@192.168.0.83:/Users/omr1/Documents/Data-proccessed/crop_frames/* /ho
 
 .venv/bin/python live_camera_predict_multiperson_inertial_640_8frames_marker.py \
   --ckpt mlp_clip_b_2frames_marker.pt --camera 1 --yolo yolov8m.pt --inertia 1
+
+
+
+
+
+#### only skeleton #### 
+
+python3 train_3frames_marker.py --marker-dir Data-processed-landmarker --num-frames 3 --out mlp_3_frames_marker.pt
+
+
+python3 live_camera_predict_marker.py --ckpt mlp_3_frames_marker.pt  --camera 1 --yolo yolov8m.pt
+
+python3 live_camera_predict_marker.py --ckpt mlp_3_frames_marker.pt --camera 1 --yolo yolov8m.pt --crop-pad 0.25 --pose-det-conf 0.2 --pose-pres-conf 0.2 --hand-det-conf 0.2 --hand-track-conf 0.2
+
+
+
+#### GRU  #### RNN 
+
+python3 train_3frames_marker.py --temporal-model gru --feat-agg con
+cat --num-frames 8 --out gru_8frames_marker.pt
+
+
+python3 live_camera_predict_marker.py --ckpt gru_8frames_marker.pt 
+ --camera 4 --yolo yolov8m.pt
+
+python3 live_camera_predict_marker.py --ckpt gru_8frames_marker.pt  --camera 4 --yolo yolo11m.pt
