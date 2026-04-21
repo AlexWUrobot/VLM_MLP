@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", default="mlp_clip_b.pt", help="Path to trained MLP checkpoint")
     p.add_argument("--camera", type=int, default=0, help="Webcam index (default 0)")
     p.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
+    p.add_argument("--cache-dir", default=None, help="Writable cache directory for OpenCLIP downloads")
     p.add_argument("--yolo", default="yolov8n.pt", help="Ultralytics YOLO model for person detection")
     p.add_argument("--yolo-conf", type=float, default=0.25, help="YOLO confidence threshold")
     p.add_argument(
@@ -54,6 +56,49 @@ def _resize_list(lst: list, n: int, fill):
     if len(lst) >= n:
         return lst[:n]
     return lst + [fill] * (n - len(lst))
+
+
+def _can_write_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_cache_dir(explicit_cache_dir: str | None) -> Path:
+    if explicit_cache_dir:
+        candidate = Path(explicit_cache_dir).expanduser()
+        if _can_write_dir(candidate):
+            return candidate
+        raise SystemExit(f"Cache directory is not writable: {candidate}")
+
+    for env_name in ("HUGGINGFACE_HUB_CACHE", "HF_HOME"):
+        raw = os.environ.get(env_name)
+        if not raw:
+            continue
+
+        candidate = Path(raw).expanduser()
+        if env_name == "HF_HOME":
+            candidate = candidate / "hub"
+
+        if _can_write_dir(candidate):
+            return candidate
+
+    for candidate in (
+        Path(__file__).resolve().parent / ".cache" / "huggingface" / "hub",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ):
+        if _can_write_dir(candidate):
+            return candidate
+
+    raise SystemExit(
+        "Could not find a writable Hugging Face cache directory. "
+        "Set --cache-dir or HUGGINGFACE_HUB_CACHE to a writable path."
+    )
 
 
 def _apply_inertia(
@@ -173,8 +218,9 @@ def main() -> None:
 
     clip_model_name = payload.get("clip_model", "ViT-B-32")
     clip_pretrained = payload.get("clip_pretrained", "openai")
+    cache_dir = _resolve_cache_dir(args.cache_dir)
     clip_model, _, preprocess = open_clip.create_model_and_transforms(
-        clip_model_name, pretrained=clip_pretrained
+        clip_model_name, pretrained=clip_pretrained, cache_dir=str(cache_dir)
     )
     clip_model = clip_model.to(device).eval()
 

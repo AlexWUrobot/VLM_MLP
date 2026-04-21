@@ -1,9 +1,10 @@
 python3 -m venv vlm_mlp
 source vlm_mlp/bin/activate
 python -m pip install -U pip
+export HUGGINGFACE_HUB_CACHE="$PWD/.cache/huggingface/hub"
 
 
-pip install torch torchvision transformers open_clip_torch pillow
+pip install torch torchvision transformers open_clip_torch pillow opencv-python ultralytics
 
 
 ======================= image processing for training ========================
