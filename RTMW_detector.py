@@ -162,13 +162,13 @@ def ensure_rtmw_model() -> str:
 # ---------------------------------------------------------------------------
 # ONNX Runtime session (TensorRT FP16 > CUDA > CPU)
 # ---------------------------------------------------------------------------
-def create_session(model_path: str, *, use_trt: bool = True):
+def create_session(model_path: str, *, use_trt: bool = True, force_cpu: bool = False):
     import onnxruntime as ort
 
     available = ort.get_available_providers()
     providers: list = []
 
-    if use_trt and "TensorrtExecutionProvider" in available:
+    if not force_cpu and use_trt and "TensorrtExecutionProvider" in available:
         cache_dir = os.path.join(MODEL_DIR, "trt_cache")
         os.makedirs(cache_dir, exist_ok=True)
         providers.append((
@@ -181,7 +181,7 @@ def create_session(model_path: str, *, use_trt: bool = True):
             },
         ))
 
-    if "CUDAExecutionProvider" in available:
+    if not force_cpu and "CUDAExecutionProvider" in available:
         providers.append(("CUDAExecutionProvider", {"device_id": 0}))
 
     providers.append(("CPUExecutionProvider", {}))
@@ -192,6 +192,15 @@ def create_session(model_path: str, *, use_trt: bool = True):
     if "TensorrtExecutionProvider" in active:
         print("[RTMW] TensorRT FP16 active — first run may take a few minutes to build the engine.")
     return sess
+
+
+def is_cuda_toolchain_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "cudaErrorUnsupportedPtxVersion" in msg
+        or "unsupported toolchain" in msg
+        or "CUDA error" in msg
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +437,7 @@ def parse_args():
     p.add_argument("--kpt-thr", type=float, default=0.3, help="Keypoint confidence for drawing")
     p.add_argument("--bbox-pad", type=float, default=1.25, help="Bbox padding ratio for RTMW crop")
     p.add_argument("--no-trt", action="store_true", help="Disable TensorRT, fall back to CUDA EP")
+    p.add_argument("--cpu", action="store_true", help="Force CPU inference and skip CUDA/TensorRT")
     p.add_argument("--no-face", action="store_true", help="Skip drawing face keypoints")
     p.add_argument("--model", default=None, help="Path to RTMW ONNX model (auto-download if omitted)")
     p.add_argument("--window", default="RTMW Detector", help="OpenCV window name")
@@ -444,12 +454,13 @@ def main():
 
     # ---- Load RTMW-l ONNX model ----
     model_path = args.model if args.model else ensure_rtmw_model()
-    sess = create_session(model_path, use_trt=not args.no_trt)
+    sess = create_session(model_path, use_trt=not args.no_trt, force_cpu=args.cpu)
     input_name = sess.get_inputs()[0].name
     output_names = [o.name for o in sess.get_outputs()]
     input_shape = sess.get_inputs()[0].shape
     print(f"[RTMW] input: {input_name}  shape={input_shape}")
     print(f"[RTMW] outputs: {output_names}")
+    gpu_fallback_used = args.cpu
 
     # ---- Load YOLO ----
     yolo = YOLO(args.yolo)
@@ -491,7 +502,22 @@ def main():
             # ---- Per-person RTMW inference ----
             for track_id, bbox, det_conf in people:
                 inp, warp_mat = preprocess(frame, bbox, args.bbox_pad)
-                outs = sess.run(output_names, {input_name: inp})
+                try:
+                    outs = sess.run(output_names, {input_name: inp})
+                except Exception as exc:
+                    if gpu_fallback_used or not is_cuda_toolchain_error(exc):
+                        raise
+                    print(
+                        "[RTMW] CUDA/TensorRT inference failed; switching to CPU. "
+                        "Install a stable ONNX Runtime build matched to your NVIDIA driver "
+                        "to restore GPU inference."
+                    )
+                    print(f"[RTMW] original error: {exc}")
+                    sess = create_session(model_path, use_trt=False, force_cpu=True)
+                    input_name = sess.get_inputs()[0].name
+                    output_names = [o.name for o in sess.get_outputs()]
+                    gpu_fallback_used = True
+                    outs = sess.run(output_names, {input_name: inp})
                 kpts, scores = postprocess(outs, warp_mat)
 
                 draw_wholebody(
