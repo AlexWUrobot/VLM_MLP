@@ -4,7 +4,11 @@ python -m pip install -U pip
 export HUGGINGFACE_HUB_CACHE="$PWD/.cache/huggingface/hub"
 
 
-pip install torch torchvision transformers open_clip_torch pillow opencv-python ultralytics
+pip install torch torchvision transformers open_clip_torch pillow opencv-python==4.11.0.86 ultralytics mediapipe onnxruntime
+
+# Linux aarch64: PyPI does not currently provide a matching `onnxruntime-gpu`
+# wheel for this environment, so use `onnxruntime` (CPU) or build GPU ORT
+# from source/vendor packages.
 
 
 ======================= image processing for training ========================
@@ -53,10 +57,6 @@ pip install torch torchvision transformers open_clip_torch pillow ultralytics op
 
 # If you want all videos under raw/<action>/, use:
 ./vlm_mlp/bin/python yolo_person_video_closest_save_crop_alltime_allvideo.py --videos-glob 'raw/*/*.mp4' --interval-ms 250 --outdir crop_frames
-
-
-
-
 
 
 
@@ -166,4 +166,35 @@ python3 train_mlp_clip_b_3frames.py \
   --out mlp_clip_b_6class_diffs.pt
 
   python3 live_camera_predict_multiperson_inertial_640_3frames.py \
-  --ckpt mlp_clip_b_6class_diffs.pt --camera 4 --yolo yolo11m.pt
+  --ckpt mlp_clip_b_6class_diffs.pt --camera 0 --yolo yolo11n.pt
+
+
+----------------------------------------------------
+GRU
+----------------------------------------------------
+python3 train_mlp_clip_b_3frames_GRU.py \
+  --temporal-model gru --num-frames 8 --epochs 30 \
+  --rnn-hidden 192 --hidden 256 --no-cache \
+  --out clip_gru_8frames.pt
+
+python3 live_camera_predict_multiperson_inertial_640_3frames_GRU.py \
+  --ckpt clip_gru_8frames.pt --camera 0 --yolo yolov8m.pt \
+  --ema-alpha 0.4 --inertia 3
+
+
+----------------------------------------------------
+Merged to 6 classes
+Class weighting
+FusionTemporalGRU
+Landmark velocity features + temporal smoothing 
+----------------------------------------------------
+
+python3 train_mlp_clip_b_8frames_marker.py \
+  --temporal-model gru --num-frames 8 --epochs 100 \
+  --rnn-hidden 192 --hidden 256 \
+  --out fusion_gru_8frames_marker.pt
+
+
+python3 live_camera_predict_multiperson_inertial_640_8frames_marker.py \
+  --ckpt fusion_gru_8frames_marker.pt --camera 0 --yolo yolo11n.pt \
+  --ema-alpha 0.4 --inertia 1

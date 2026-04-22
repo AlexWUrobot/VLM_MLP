@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
-LABELS_IN_ORDER = [
+# ── Source labels (filenames on disk) ──
+SOURCE_LABELS_IN_ORDER = [
     "come",
     "idle_back",
     "idle_front",
@@ -23,15 +24,34 @@ LABELS_IN_ORDER = [
     "wave",
 ]
 
+# ── Merged 6-class labels (what the model predicts) ──
+LABELS_IN_ORDER = [
+    "come",
+    "idle",
+    "phone",
+    "play_phone",
+    "stop",
+    "wave",
+]
+
+_MERGE_TO_IDLE = {"idle_back", "idle_front", "none"}
+
+_ALL_FILENAME_LABELS = sorted(
+    list(LABELS_IN_ORDER) + list(_MERGE_TO_IDLE),
+    key=len, reverse=True,
+)
+
 
 def label_to_index_0_based(label: str) -> int:
     return LABELS_IN_ORDER.index(label)
 
 
 def infer_label_from_filename(name: str) -> str | None:
-    # Prefer longest labels first to avoid matching 'phone' before 'play_phone'
-    for label in sorted(LABELS_IN_ORDER, key=len, reverse=True):
+    """Recognise old 8-class AND new 6-class filenames, merging idle variants."""
+    for label in _ALL_FILENAME_LABELS:
         if name == label or name.startswith(label + "_"):
+            if label in _MERGE_TO_IDLE:
+                return "idle"
             return label
     return None
 
@@ -175,6 +195,104 @@ class FusionTemporalMLP(nn.Module):
             h = frame_e.mean(dim=1)
 
         h = F.relu(self.fc1(h))
+        h = F.dropout(h, p=0.2, training=self.training)
+        h = F.relu(self.fc2(h))
+        h = F.dropout(h, p=0.2, training=self.training)
+        return self.fc3(h)
+
+
+class FusionTemporalGRU(nn.Module):
+    """GRU variant of the fusion model — processes frame sequences with temporal awareness.
+
+    Each frame is projected per-modality (CLIP / pose / hands / hand_mask) the same
+    way as FusionTemporalMLP, then the sequence of frame embeddings is fed into a
+    GRU so the model can learn temporal ordering and motion patterns.
+    """
+
+    def __init__(
+        self,
+        *,
+        clip_dim: int,
+        pose_dim: int,
+        hand_dim: int,
+        hand_mask_dim: int,
+        proj_dim: int,
+        hidden: int,
+        num_classes: int,
+        num_frames: int,
+        rnn_hidden: int = 192,
+        rnn_layers: int = 1,
+        bidirectional: bool = False,
+    ):
+        super().__init__()
+
+        self.clip_dim = int(clip_dim)
+        self.pose_dim = int(pose_dim)
+        self.hand_dim = int(hand_dim)
+        self.hand_mask_dim = int(hand_mask_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+        self.num_frames = max(1, int(num_frames))
+
+        self.proj_dim = int(proj_dim)
+        self.rnn_hidden = int(rnn_hidden)
+        self.rnn_layers = max(1, int(rnn_layers))
+        self.bidirectional = bool(bidirectional)
+
+        def _proj(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(int(in_dim), self.proj_dim),
+                nn.LayerNorm(self.proj_dim),
+                nn.ReLU(),
+            )
+
+        self.clip_proj = _proj(self.clip_dim)
+        self.pose_proj = _proj(self.pose_dim)
+        self.hand_proj = _proj(self.hand_dim)
+        self.hand_mask_proj = _proj(self.hand_mask_dim)
+        self.frame_embed_dim = self.proj_dim * 4
+
+        self.gru = nn.GRU(
+            input_size=self.frame_embed_dim,
+            hidden_size=self.rnn_hidden,
+            num_layers=self.rnn_layers,
+            batch_first=True,
+            bidirectional=self.bidirectional,
+            dropout=0.2 if self.rnn_layers > 1 else 0.0,
+        )
+
+        head_in = self.rnn_hidden * (2 if self.bidirectional else 1)
+        self.fc1 = nn.Linear(head_in, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] != self.num_frames * self.per_frame_dim:
+            raise RuntimeError(
+                f"input dim mismatch: got {x.shape[1]} expected {self.num_frames * self.per_frame_dim}"
+            )
+
+        xf = x.view(x.shape[0], self.num_frames, self.per_frame_dim)
+
+        clip = xf[:, :, : self.clip_dim]
+        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
+        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
+        hmask = xf[:, :, -self.hand_mask_dim :]
+
+        b, t, _ = xf.shape
+        clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
+        pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
+        hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
+        mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
+        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+
+        out, hidden = self.gru(frame_e)
+
+        if self.bidirectional:
+            last_hidden = torch.cat([hidden[-2], hidden[-1]], dim=1)
+        else:
+            last_hidden = hidden[-1]
+
+        h = F.relu(self.fc1(last_hidden))
         h = F.dropout(h, p=0.2, training=self.training)
         h = F.relu(self.fc2(h))
         h = F.dropout(h, p=0.2, training=self.training)
@@ -335,13 +453,18 @@ def build_temporal_windows(
     num_frames: int,
     stride: int,
     feat_agg: str,
+    use_velocity: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Build an 8-frame (or N-frame) feature vector per training example.
+    """Build an N-frame feature vector per training example.
 
-    We group frames by (label, clip_id) inferred from the filename, sort by timestamp,
-    then take sliding windows of length num_frames.
+    When use_velocity=True AND feat_agg='concat', appends (N-1) frame-difference
+    vectors (landmark velocity) so the model gets explicit motion signals.
+    This is critical for distinguishing come/wave (dynamic) from stop/idle (static).
 
-    Returns (X, y, keys) where keys are per-window clip keys for leakage-free splitting.
+    Output dim per window:
+      feat_agg='concat', use_velocity=False:  N * D
+      feat_agg='concat', use_velocity=True:   N * D + (N-1) * D = (2N-1) * D
+      feat_agg='mean':                        D  (velocity ignored)
     """
     num_frames = max(1, int(num_frames))
     stride = max(1, int(stride))
@@ -382,7 +505,11 @@ def build_temporal_windows(
             if feat_agg == "mean":
                 x = f.mean(axis=0)
             else:
-                x = f.reshape(-1)
+                parts = [f.reshape(-1)]
+                if use_velocity and num_frames > 1:
+                    diffs = f[1:] - f[:-1]  # (N-1, D) — landmark velocity
+                    parts.append(diffs.reshape(-1))
+                x = np.concatenate(parts)
             xs.append(x.astype(np.float32, copy=False))
             ys_out.append(y0)
             keys_out.append(key)
@@ -426,7 +553,7 @@ def split_by_key(
     return x_train, y_train, x_val, y_val
 
 
-def train_mlp(
+def train_model(
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_val: np.ndarray,
@@ -445,7 +572,11 @@ def train_mlp(
     epochs: int,
     batch_size: int,
     seed: int,
-) -> tuple[FusionTemporalMLP, dict]:
+    temporal_model: str = "mlp",
+    rnn_hidden: int = 192,
+    rnn_layers: int = 1,
+    bidirectional: bool = False,
+) -> tuple[nn.Module, dict]:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -454,18 +585,46 @@ def train_mlp(
     x_val_t = torch.from_numpy(x_val)
     y_val_t = torch.from_numpy(y_val)
 
-    model = FusionTemporalMLP(
-        clip_dim=int(clip_dim),
-        pose_dim=int(pose_dim),
-        hand_dim=int(hand_dim),
-        hand_mask_dim=int(hand_mask_dim),
-        proj_dim=int(proj_dim),
-        hidden=hidden,
-        num_classes=len(LABELS_IN_ORDER),
-        num_frames=int(num_frames),
-        feat_agg=str(feat_agg),
-    ).to(device)
+    temporal_model = str(temporal_model).lower().strip()
+    if temporal_model == "gru":
+        if str(feat_agg).lower().strip() != "concat":
+            raise SystemExit("GRU requires --feat-agg=concat to preserve frame order.")
+        model = FusionTemporalGRU(
+            clip_dim=int(clip_dim),
+            pose_dim=int(pose_dim),
+            hand_dim=int(hand_dim),
+            hand_mask_dim=int(hand_mask_dim),
+            proj_dim=int(proj_dim),
+            hidden=hidden,
+            num_classes=len(LABELS_IN_ORDER),
+            num_frames=int(num_frames),
+            rnn_hidden=int(rnn_hidden),
+            rnn_layers=int(rnn_layers),
+            bidirectional=bool(bidirectional),
+        ).to(device)
+    else:
+        model = FusionTemporalMLP(
+            clip_dim=int(clip_dim),
+            pose_dim=int(pose_dim),
+            hand_dim=int(hand_dim),
+            hand_mask_dim=int(hand_mask_dim),
+            proj_dim=int(proj_dim),
+            hidden=hidden,
+            num_classes=len(LABELS_IN_ORDER),
+            num_frames=int(num_frames),
+            feat_agg=str(feat_agg),
+        ).to(device)
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    # Sqrt-inverse-frequency class weights: boosts rare classes without
+    # crushing well-represented ones.
+    class_counts = np.bincount(y_train, minlength=len(LABELS_IN_ORDER)).astype(np.float64)
+    class_counts = np.maximum(class_counts, 1.0)
+    inv_freq = 1.0 / np.sqrt(class_counts)
+    class_weights = torch.tensor(inv_freq / inv_freq.sum() * len(LABELS_IN_ORDER), dtype=torch.float32).to(device)
+    print(f"[class weights] {dict(zip(LABELS_IN_ORDER, [f'{w:.3f}' for w in class_weights.tolist()]))}")
+    print(f"[class counts ] {dict(zip(LABELS_IN_ORDER, [int(c) for c in class_counts.tolist()]))}")
 
     def accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
         pred = logits.argmax(dim=1)
@@ -488,7 +647,7 @@ def train_mlp(
 
             opt.zero_grad(set_to_none=True)
             logits = model(xb)
-            loss = F.cross_entropy(logits, yb)
+            loss = F.cross_entropy(logits, yb, weight=class_weights)
             loss.backward()
             opt.step()
 
@@ -499,7 +658,7 @@ def train_mlp(
         with torch.inference_mode():
             if x_val_t.numel():
                 val_logits = model(x_val_t.to(device))
-                val_loss = float(F.cross_entropy(val_logits, y_val_t.to(device)).item())
+                val_loss = float(F.cross_entropy(val_logits, y_val_t.to(device), weight=class_weights).item())
                 val_acc = accuracy(val_logits, y_val_t.to(device))
             else:
                 val_loss = 0.0
@@ -551,6 +710,21 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
 
+    parser.add_argument(
+        "--temporal-model",
+        default="mlp",
+        choices=["mlp", "gru"],
+        help="Temporal head: MLP (flat concat) or GRU (sequence-aware). Default: mlp.",
+    )
+    parser.add_argument("--rnn-hidden", type=int, default=192, help="GRU hidden size")
+    parser.add_argument("--rnn-layers", type=int, default=1, help="Number of GRU layers")
+    parser.add_argument("--bidirectional", action="store_true", help="Use a bidirectional GRU.")
+    parser.add_argument(
+        "--use-velocity",
+        action="store_true",
+        help="Append inter-frame difference (velocity) features. Critical for come vs stop.",
+    )
+
     parser.add_argument("--out", default="mlp_clip_b_8frames_marker.pt", help="Output model checkpoint")
     args = parser.parse_args()
 
@@ -569,6 +743,12 @@ def main() -> None:
     if (not args.no_cache) and cache_path.exists():
         feats, ys, paths = load_cache(cache_path)
         print(f"Loaded cached per-frame features: {cache_path} | feats={feats.shape}")
+        # Re-derive labels from filenames to handle 8->6 class merge
+        ys_new = []
+        for p in paths:
+            label = infer_label_from_filename(Path(p).stem)
+            ys_new.append(label_to_index_0_based(label) if label else 0)
+        ys = np.asarray(ys_new, dtype=np.int64)
     else:
         feats, ys, paths = extract_clip_features(samples, batch_size=args.batch_size, device=device)
         print(f"Extracted per-frame features: feats={feats.shape}")
@@ -612,6 +792,11 @@ def main() -> None:
         f"frames_with_any_missing_hands={missing_hands_any}/{len(paths)}"
     )
 
+    # GRU processes raw frame sequences; velocity only used for MLP
+    use_velocity = bool(args.use_velocity) and (args.temporal_model != "gru")
+    if args.temporal_model == "gru" and args.feat_agg != "concat":
+        raise SystemExit("GRU requires --feat-agg=concat to preserve frame order.")
+
     X, y, keys = build_temporal_windows(
         feats=feats_combined,
         ys=ys,
@@ -619,15 +804,18 @@ def main() -> None:
         num_frames=args.num_frames,
         stride=args.stride,
         feat_agg=args.feat_agg,
+        use_velocity=use_velocity,
     )
 
     x_train, y_train, x_val, y_val = split_by_key(X, y, keys, seed=args.seed, val_ratio=0.1)
     print(
-        f"Temporal windows: X={X.shape} (per_frame_dim={per_frame_dim}) | train={x_train.shape[0]} val={x_val.shape[0]} | "
-        f"num_frames={int(args.num_frames)} feat_agg={args.feat_agg} stride={int(args.stride)}"
+        f"Temporal windows: X={X.shape} (per_frame_dim={per_frame_dim}, velocity={use_velocity}) | "
+        f"train={x_train.shape[0]} val={x_val.shape[0]} | "
+        f"num_frames={int(args.num_frames)} feat_agg={args.feat_agg} stride={int(args.stride)} "
+        f"temporal_model={args.temporal_model}"
     )
 
-    model, metrics = train_mlp(
+    model, metrics = train_model(
         x_train=x_train,
         y_train=y_train,
         x_val=x_val,
@@ -645,6 +833,10 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         seed=args.seed,
+        temporal_model=args.temporal_model,
+        rnn_hidden=args.rnn_hidden,
+        rnn_layers=args.rnn_layers,
+        bidirectional=args.bidirectional,
     )
 
     out_path = Path(args.out)
@@ -658,14 +850,19 @@ def main() -> None:
         "pose_dim": int(POSE_DIM),
         "hand_dim": int(HAND_DIM),
         "hand_mask_dim": int(HAND_MASK_DIM),
-        "model_type": "fusion_temporal_mlp",
+        "model_type": str(args.temporal_model),
         "base_feature_dim": int(per_frame_dim),
         "feature_dim": int(X.shape[1]),
         "hidden": int(args.hidden),
         "proj_dim": int(args.proj_dim),
         "num_frames": int(args.num_frames),
         "feat_agg": str(args.feat_agg),
+        "use_velocity": use_velocity,
         "stride": int(args.stride),
+        "temporal_model": str(args.temporal_model),
+        "rnn_hidden": int(args.rnn_hidden),
+        "rnn_layers": int(args.rnn_layers),
+        "bidirectional": bool(args.bidirectional),
         "metrics": metrics,
     }
     torch.save(payload, out_path)

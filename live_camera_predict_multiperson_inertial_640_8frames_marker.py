@@ -7,6 +7,7 @@ from collections import deque
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -96,6 +97,95 @@ class FusionTemporalMLP(nn.Module):
             h = frame_e.mean(dim=1)
 
         h = F.relu(self.fc1(h))
+        h = F.relu(self.fc2(h))
+        return self.fc3(h)
+
+
+class FusionTemporalGRU(nn.Module):
+    """GRU variant — processes frame sequences with temporal awareness."""
+
+    def __init__(
+        self,
+        *,
+        clip_dim: int,
+        pose_dim: int,
+        hand_dim: int,
+        hand_mask_dim: int,
+        proj_dim: int,
+        hidden: int,
+        num_classes: int,
+        num_frames: int,
+        rnn_hidden: int = 192,
+        rnn_layers: int = 1,
+        bidirectional: bool = False,
+    ):
+        super().__init__()
+
+        self.clip_dim = int(clip_dim)
+        self.pose_dim = int(pose_dim)
+        self.hand_dim = int(hand_dim)
+        self.hand_mask_dim = int(hand_mask_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+        self.num_frames = max(1, int(num_frames))
+
+        self.proj_dim = int(proj_dim)
+        self.rnn_hidden = int(rnn_hidden)
+        self.rnn_layers = max(1, int(rnn_layers))
+        self.bidirectional = bool(bidirectional)
+
+        def _proj(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(int(in_dim), self.proj_dim),
+                nn.LayerNorm(self.proj_dim),
+                nn.ReLU(),
+            )
+
+        self.clip_proj = _proj(self.clip_dim)
+        self.pose_proj = _proj(self.pose_dim)
+        self.hand_proj = _proj(self.hand_dim)
+        self.hand_mask_proj = _proj(self.hand_mask_dim)
+        self.frame_embed_dim = self.proj_dim * 4
+
+        self.gru = nn.GRU(
+            input_size=self.frame_embed_dim,
+            hidden_size=self.rnn_hidden,
+            num_layers=self.rnn_layers,
+            batch_first=True,
+            bidirectional=self.bidirectional,
+            dropout=0.2 if self.rnn_layers > 1 else 0.0,
+        )
+
+        head_in = self.rnn_hidden * (2 if self.bidirectional else 1)
+        self.fc1 = nn.Linear(head_in, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] != self.num_frames * self.per_frame_dim:
+            raise RuntimeError(
+                f"input dim mismatch: got {x.shape[1]} expected {self.num_frames * self.per_frame_dim}"
+            )
+        xf = x.view(x.shape[0], self.num_frames, self.per_frame_dim)
+
+        clip = xf[:, :, : self.clip_dim]
+        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
+        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
+        hmask = xf[:, :, -self.hand_mask_dim :]
+
+        b, t, _ = xf.shape
+        clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
+        pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
+        hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
+        mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
+        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+
+        out, hidden = self.gru(frame_e)
+        if self.bidirectional:
+            last_hidden = torch.cat([hidden[-2], hidden[-1]], dim=1)
+        else:
+            last_hidden = hidden[-1]
+
+        h = F.relu(self.fc1(last_hidden))
         h = F.relu(self.fc2(h))
         return self.fc3(h)
 
@@ -264,6 +354,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Change a label only after N consecutive predictions (default: 3). Use 1 to disable.",
+    )
+    p.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.4,
+        help="EMA smoothing factor for softmax probabilities (0=full history, 1=no smoothing). Default: 0.4.",
     )
     p.add_argument("--window", default="Live Prediction", help="OpenCV window name")
     return p.parse_args()
@@ -475,19 +571,43 @@ def main() -> None:
     if feat_agg not in {"concat", "mean"}:
         feat_agg = "concat"
 
-    mlp = FusionTemporalMLP(
-        clip_dim=int(payload.get("clip_feature_dim", 512)),
-        pose_dim=int(payload.get("pose_dim", POSE_DIM)),
-        hand_dim=int(payload.get("hand_dim", HAND_DIM)),
-        hand_mask_dim=int(payload.get("hand_mask_dim", HAND_MASK_DIM)),
-        proj_dim=proj_dim,
-        hidden=hidden,
-        num_classes=len(labels),
-        num_frames=int(payload.get("num_frames", 8)),
-        feat_agg=str(payload.get("feat_agg", "concat")),
-    ).to(device)
-    mlp.load_state_dict(payload["state_dict"], strict=True)
-    mlp.eval()
+    temporal_model_type = str(payload.get("temporal_model", payload.get("model_type", "mlp"))).lower().strip()
+    use_velocity = bool(payload.get("use_velocity", False))
+    print(f"[ckpt] temporal_model={temporal_model_type} num_frames={num_frames} feat_agg={feat_agg} use_velocity={use_velocity} classes={len(labels)}")
+
+    _clip_dim = int(payload.get("clip_feature_dim", 512))
+    _pose_dim = int(payload.get("pose_dim", POSE_DIM))
+    _hand_dim = int(payload.get("hand_dim", HAND_DIM))
+    _hand_mask_dim = int(payload.get("hand_mask_dim", HAND_MASK_DIM))
+
+    if temporal_model_type == "gru":
+        model = FusionTemporalGRU(
+            clip_dim=_clip_dim,
+            pose_dim=_pose_dim,
+            hand_dim=_hand_dim,
+            hand_mask_dim=_hand_mask_dim,
+            proj_dim=proj_dim,
+            hidden=hidden,
+            num_classes=len(labels),
+            num_frames=num_frames,
+            rnn_hidden=int(payload.get("rnn_hidden", 192)),
+            rnn_layers=int(payload.get("rnn_layers", 1)),
+            bidirectional=bool(payload.get("bidirectional", False)),
+        ).to(device)
+    else:
+        model = FusionTemporalMLP(
+            clip_dim=_clip_dim,
+            pose_dim=_pose_dim,
+            hand_dim=_hand_dim,
+            hand_mask_dim=_hand_mask_dim,
+            proj_dim=proj_dim,
+            hidden=hidden,
+            num_classes=len(labels),
+            num_frames=num_frames,
+            feat_agg=feat_agg,
+        ).to(device)
+    model.load_state_dict(payload["state_dict"], strict=True)
+    model.eval()
 
     clip_model_name = payload.get("clip_model", "ViT-B-32")
     clip_pretrained = payload.get("clip_pretrained", "openai")
@@ -498,14 +618,12 @@ def main() -> None:
 
     expected_per_frame_dim = int(payload.get("base_feature_dim", 0))
     expected_total_dim = int(payload.get("feature_dim", feature_dim))
-    clip_dim_expected = int(payload.get("clip_feature_dim", 512))
 
-
-    if clip_dim_expected != 512:
-        print(f"[warn] clip_feature_dim in ckpt is {clip_dim_expected} (expected 512)")
+    if _clip_dim != 512:
+        print(f"[warn] clip_feature_dim in ckpt is {_clip_dim} (expected 512)")
 
     if expected_per_frame_dim:
-        implied = clip_dim_expected + POSE_DIM + HAND_DIM + HAND_MASK_DIM
+        implied = _clip_dim + POSE_DIM + HAND_DIM + HAND_MASK_DIM
         if implied != expected_per_frame_dim:
             raise SystemExit(
                 f"Checkpoint base_feature_dim mismatch: ckpt={expected_per_frame_dim} implied={implied}"
@@ -569,6 +687,10 @@ def main() -> None:
     pending_counts: list[int] = []
 
     feat_histories: list[deque[torch.Tensor]] = []
+    # EMA-smoothed softmax probabilities per tracked person
+    ema_probs: list[torch.Tensor | None] = []
+    ema_alpha = max(0.0, min(1.0, float(args.ema_alpha)))
+    print(f"[smoothing] ema_alpha={ema_alpha:.2f} (0=full history, 1=no smoothing)")
 
     frame_i = 0
     t0 = time.time()
@@ -596,6 +718,7 @@ def main() -> None:
             pending_classes = _resize_list(pending_classes, len(boxes), None)
             pending_counts = _resize_list(pending_counts, len(boxes), 0)
             feat_histories = _resize_histories(feat_histories, len(boxes), max(1, num_frames))
+            ema_probs = _resize_list(ema_probs, len(boxes), None)
 
             do_predict = frame_i % max(1, int(args.every)) == 0
             if do_predict:
@@ -621,7 +744,7 @@ def main() -> None:
                         # Update per-person feature histories using current detections.
                         nan_pose = [float("nan")] * POSE_DIM
                         for j, box_i in enumerate(crop_to_box_i):
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgbs[j])
+                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop_rgbs[j]))
 
                             pose_result = pose_landmarker.detect(mp_image)
                             hand_result = hand_landmarker.detect(mp_image)
@@ -666,14 +789,24 @@ def main() -> None:
 
                         if xs:
                             xb = torch.stack(xs, dim=0).to(device)
-                            logits = mlp(xb)
+                            logits = model(xb)
                             probs = torch.softmax(logits, dim=1)
-                            pred0s = probs.argmax(dim=1).tolist()
-                            top1_confs = probs.max(dim=1).values.tolist()
 
-                            for pred0, conf, box_i in zip(pred0s, top1_confs, xs_box_i, strict=False):
-                                raw_classes[int(box_i)] = int(pred0)
-                                raw_confs[int(box_i)] = float(conf)
+                            # EMA temporal smoothing per person
+                            for idx_in_batch, box_i in enumerate(xs_box_i):
+                                raw_p = probs[idx_in_batch].detach().cpu()
+                                prev = ema_probs[box_i]
+                                if prev is None:
+                                    ema_probs[box_i] = raw_p
+                                else:
+                                    ema_probs[box_i] = ema_alpha * raw_p + (1.0 - ema_alpha) * prev
+
+                            # Derive predictions from smoothed probabilities
+                            for box_i in xs_box_i:
+                                sp = ema_probs[box_i]
+                                if sp is not None:
+                                    raw_classes[box_i] = int(sp.argmax().item())
+                                    raw_confs[box_i] = float(sp.max().item())
 
                         stable_classes, pending_classes, pending_counts = _apply_inertia(
                             raw_classes,
@@ -701,6 +834,7 @@ def main() -> None:
                     pending_classes = []
                     pending_counts = []
                     feat_histories = []
+                    ema_probs = []
 
             # draw bboxes + labels
             for i, (x1, y1, x2, y2) in enumerate(boxes):
