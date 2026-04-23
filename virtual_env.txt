@@ -198,3 +198,41 @@ python3 train_mlp_clip_b_8frames_marker.py \
 python3 live_camera_predict_multiperson_inertial_640_8frames_marker.py \
   --ckpt fusion_gru_8frames_marker.pt --camera 0 --yolo yolo11n.pt \
   --ema-alpha 0.4 --inertia 1
+
+
+----------------------------------------------------
+Clip Phone Probe
+----------------------------------------------------
+
+clip(512) + pose(165) + hands(126) + hand_mask(126) + phone_probe(5) = 934-dim (was 929)
+
+#	Prompt	Purpose
+1	"a person holding a cell phone"	phone/play_phone ↑
+2	"a person talking on a phone"	phone ↑
+3	"a person looking at a phone screen"	play_phone ↑
+4	"a person with empty hands"	idle/come/stop/wave ↑
+5	"a person waving their hand"	wave ↑
+
+---------------------------------------------------------------
+
+
+python3 train_mlp_clip_b_8frames_marker_upbody.py   --temporal-model gru --num-frames 8 --epochs 100   --rnn-hidd
+en 192 --hidden 256   --out fusion_gru_8frames_marker.pt
+
+
+export HUGGINGFACE_HUB_CACHE="$PWD/.cache/huggingface/hub"
+
+python3 live_camera_predict_multiperson_inertial_640_8frames_marker_upbody.py \
+  --ckpt fusion_gru_8frames_marker.pt \
+  --camera 0 --yolo yolo11n.pt \
+  --ema-alpha 0.4 --inertia 1
+
+
+---------------------------------------------------------------
+
+# speed up 
+
+python3 RTMW_detector_acc.py --yolo yolo11n.engine --camera 0
+
+
+python3 RTMW_detector_acc.py --yolo yolo11n.engine --camera 0 --width 640 --height 480
