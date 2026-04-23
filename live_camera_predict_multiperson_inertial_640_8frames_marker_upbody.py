@@ -4,6 +4,7 @@ import threading
 import time
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
@@ -22,6 +23,7 @@ class FusionTemporalMLP(nn.Module):
         pose_dim: int,
         hand_dim: int,
         hand_mask_dim: int,
+        phone_probe_dim: int = 0,
         proj_dim: int,
         hidden: int,
         num_classes: int,
@@ -34,7 +36,8 @@ class FusionTemporalMLP(nn.Module):
         self.pose_dim = int(pose_dim)
         self.hand_dim = int(hand_dim)
         self.hand_mask_dim = int(hand_mask_dim)
-        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+        self.phone_probe_dim = int(phone_probe_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim + self.phone_probe_dim
 
         self.num_frames = max(1, int(num_frames))
         self.feat_agg = str(feat_agg).lower().strip()
@@ -54,8 +57,10 @@ class FusionTemporalMLP(nn.Module):
         self.pose_proj = _proj(self.pose_dim)
         self.hand_proj = _proj(self.hand_dim)
         self.hand_mask_proj = _proj(self.hand_mask_dim)
+        if self.phone_probe_dim > 0:
+            self.phone_probe_proj = _proj(self.phone_probe_dim)
 
-        self.frame_embed_dim = self.proj_dim * 4
+        self.frame_embed_dim = self.proj_dim * (5 if self.phone_probe_dim > 0 else 4)
 
         if self.feat_agg == "concat":
             head_in = self.frame_embed_dim * self.num_frames
@@ -78,18 +83,27 @@ class FusionTemporalMLP(nn.Module):
                 raise RuntimeError(f"input dim mismatch: got {x.shape[1]} expected {self.per_frame_dim}")
             xf = x.view(x.shape[0], 1, self.per_frame_dim)
 
-        clip = xf[:, :, : self.clip_dim]
-        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
-        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
-        hmask = xf[:, :, -self.hand_mask_dim :]
+        o1 = self.clip_dim
+        o2 = o1 + self.pose_dim
+        o3 = o2 + self.hand_dim
+        o4 = o3 + self.hand_mask_dim
+        clip = xf[:, :, :o1]
+        pose = xf[:, :, o1:o2]
+        hands = xf[:, :, o2:o3]
+        hmask = xf[:, :, o3:o4]
 
         b, t, _ = xf.shape
         clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
         pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
         hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
         mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
+        parts = [clip_e, pose_e, hand_e, mask_e]
+        if self.phone_probe_dim > 0:
+            phone = xf[:, :, o4:]
+            phone_e = self.phone_probe_proj(phone.reshape(b * t, self.phone_probe_dim))
+            parts.append(phone_e)
 
-        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+        frame_e = torch.cat(parts, dim=1).view(b, t, self.frame_embed_dim)
 
         if self.feat_agg == "concat":
             h = frame_e.reshape(b, t * self.frame_embed_dim)
@@ -111,6 +125,7 @@ class FusionTemporalGRU(nn.Module):
         pose_dim: int,
         hand_dim: int,
         hand_mask_dim: int,
+        phone_probe_dim: int = 0,
         proj_dim: int,
         hidden: int,
         num_classes: int,
@@ -125,7 +140,8 @@ class FusionTemporalGRU(nn.Module):
         self.pose_dim = int(pose_dim)
         self.hand_dim = int(hand_dim)
         self.hand_mask_dim = int(hand_mask_dim)
-        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+        self.phone_probe_dim = int(phone_probe_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim + self.phone_probe_dim
         self.num_frames = max(1, int(num_frames))
 
         self.proj_dim = int(proj_dim)
@@ -144,7 +160,9 @@ class FusionTemporalGRU(nn.Module):
         self.pose_proj = _proj(self.pose_dim)
         self.hand_proj = _proj(self.hand_dim)
         self.hand_mask_proj = _proj(self.hand_mask_dim)
-        self.frame_embed_dim = self.proj_dim * 4
+        if self.phone_probe_dim > 0:
+            self.phone_probe_proj = _proj(self.phone_probe_dim)
+        self.frame_embed_dim = self.proj_dim * (5 if self.phone_probe_dim > 0 else 4)
 
         self.gru = nn.GRU(
             input_size=self.frame_embed_dim,
@@ -167,17 +185,26 @@ class FusionTemporalGRU(nn.Module):
             )
         xf = x.view(x.shape[0], self.num_frames, self.per_frame_dim)
 
-        clip = xf[:, :, : self.clip_dim]
-        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
-        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
-        hmask = xf[:, :, -self.hand_mask_dim :]
+        o1 = self.clip_dim
+        o2 = o1 + self.pose_dim
+        o3 = o2 + self.hand_dim
+        o4 = o3 + self.hand_mask_dim
+        clip = xf[:, :, :o1]
+        pose = xf[:, :, o1:o2]
+        hands = xf[:, :, o2:o3]
+        hmask = xf[:, :, o3:o4]
 
         b, t, _ = xf.shape
         clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
         pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
         hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
         mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
-        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+        parts = [clip_e, pose_e, hand_e, mask_e]
+        if self.phone_probe_dim > 0:
+            phone = xf[:, :, o4:]
+            phone_e = self.phone_probe_proj(phone.reshape(b * t, self.phone_probe_dim))
+            parts.append(phone_e)
+        frame_e = torch.cat(parts, dim=1).view(b, t, self.frame_embed_dim)
 
         out, hidden = self.gru(frame_e)
         if self.bidirectional:
@@ -190,8 +217,15 @@ class FusionTemporalGRU(nn.Module):
         return self.fc3(h)
 
 
-POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
-POSE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "pose_landmarker_heavy.task")
+POSE_MODEL_URLS = {
+    "lite": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    "full": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+    "heavy": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+}
+POSE_MODEL_PATHS = {
+    k: os.path.join(os.path.dirname(__file__), "models", f"pose_landmarker_{k}.task")
+    for k in POSE_MODEL_URLS
+}
 
 HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 HAND_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.task")
@@ -199,6 +233,17 @@ HAND_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landma
 POSE_DIM = 165
 HAND_DIM = 126
 HAND_MASK_DIM = HAND_DIM
+
+PHONE_PROBE_PROMPTS = [
+    "a person holding a cell phone",
+    "a person talking on a phone",
+    "a person looking at a phone screen",
+    "a person with empty hands",
+    "a person waving their hand",
+]
+PHONE_PROBE_DIM = len(PHONE_PROBE_PROMPTS)
+
+COCO_PHONE_CLASS = 67  # cell phone in COCO
 
 
 def ensure_model(*, model_url: str, model_path: str, label: str) -> None:
@@ -300,6 +345,7 @@ def combine_frame_features(
     clip_feat: torch.Tensor,
     pose_vec: list[float],
     hand_vec: list[float],
+    phone_probe: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # pose: impute NaN -> 0 (no mask)
     pose_t = torch.tensor(pose_vec, dtype=torch.float32)
@@ -312,8 +358,11 @@ def combine_frame_features(
 
     clip_t = clip_feat.to(torch.float32)
 
-    # [clip(512), pose(165), hands(126), hand_mask(126)]
-    return torch.cat([clip_t, pose_t, hands_t, hand_mask_t], dim=0)
+    # [clip(512), pose(165), hands(126), hand_mask(126), phone_probe(P)]
+    parts = [clip_t, pose_t, hands_t, hand_mask_t]
+    if phone_probe is not None:
+        parts.append(phone_probe.to(torch.float32))
+    return torch.cat(parts, dim=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,6 +409,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.4,
         help="EMA smoothing factor for softmax probabilities (0=full history, 1=no smoothing). Default: 0.4.",
+    )
+    p.add_argument(
+        "--phone-gate",
+        type=float,
+        default=0.1,
+        help="When YOLO detects NO phone near a person, multiply phone/play_phone probs by this factor "
+             "(0.0=fully suppress, 1.0=disable gate). Default: 0.1.",
+    )
+    p.add_argument(
+        "--pose-model",
+        default="lite",
+        choices=["lite", "full", "heavy"],
+        help="MediaPipe pose landmarker weight: lite (fastest), full, or heavy (most accurate). Default: lite.",
     )
     p.add_argument("--window", default="Live Prediction", help="OpenCV window name")
     return p.parse_args()
@@ -495,24 +557,34 @@ def get_person_boxes(
     frame_bgr, yolo_model, yolo_conf: float, yolo_iou: float
 ) -> list[tuple[int, int, int, int]]:
     """Return a list of person bboxes (x1,y1,x2,y2) sorted by area desc."""
+    boxes, _ = get_person_and_phone_boxes(frame_bgr, yolo_model, yolo_conf, yolo_iou)
+    return boxes
+
+
+def get_person_and_phone_boxes(
+    frame_bgr, yolo_model, yolo_conf: float, yolo_iou: float
+) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+    """Detect persons (class 0) and phones (class 67) in one YOLO call."""
     results = yolo_model.predict(
         frame_bgr,
         conf=yolo_conf,
         iou=float(yolo_iou),
-        classes=[0],
+        classes=[0, COCO_PHONE_CLASS],
         verbose=False,
     )
     r = results[0]
     if getattr(r, "boxes", None) is None or len(r.boxes) == 0:
-        return []
+        return [], []
 
     h, w = frame_bgr.shape[:2]
-    boxes: list[tuple[int, int, int, int]] = []
-    areas: list[int] = []
+    person_boxes: list[tuple[int, int, int, int]] = []
+    person_areas: list[int] = []
+    phone_boxes: list[tuple[int, int, int, int]] = []
 
     for box in r.boxes:
         if box.xyxy is None or len(box.xyxy) == 0:
             continue
+        cls_id = int(box.cls[0].item()) if box.cls is not None else -1
         x1f, y1f, x2f, y2f = box.xyxy[0].tolist()
         x1, y1, x2, y2 = int(x1f), int(y1f), int(x2f), int(y2f)
         x1 = max(0, min(x1, w - 1))
@@ -522,11 +594,29 @@ def get_person_boxes(
         area = max(0, x2 - x1) * max(0, y2 - y1)
         if area <= 0:
             continue
-        boxes.append((x1, y1, x2, y2))
-        areas.append(area)
+        if cls_id == 0:
+            person_boxes.append((x1, y1, x2, y2))
+            person_areas.append(area)
+        elif cls_id == COCO_PHONE_CLASS:
+            phone_boxes.append((x1, y1, x2, y2))
 
-    order = sorted(range(len(boxes)), key=lambda i: areas[i], reverse=True)
-    return [boxes[i] for i in order]
+    order = sorted(range(len(person_boxes)), key=lambda i: person_areas[i], reverse=True)
+    person_boxes = [person_boxes[i] for i in order]
+    return person_boxes, phone_boxes
+
+
+def phone_near_person(
+    person_box: tuple[int, int, int, int],
+    phone_boxes: list[tuple[int, int, int, int]],
+) -> bool:
+    """True if any phone box centre falls inside the person box."""
+    px1, py1, px2, py2 = person_box
+    for qx1, qy1, qx2, qy2 in phone_boxes:
+        cx = (qx1 + qx2) / 2
+        cy = (qy1 + qy2) / 2
+        if px1 <= cx <= px2 and py1 <= cy <= py2:
+            return True
+    return False
 
 
 @torch.inference_mode()
@@ -555,7 +645,13 @@ def main() -> None:
     except Exception as exc:
         raise SystemExit("Failed to import mediapipe. Install mediapipe.") from exc
 
-    ensure_model(model_url=POSE_MODEL_URL, model_path=POSE_MODEL_PATH, label="Pose Landmarker (heavy)")
+    pose_weight = str(args.pose_model).lower().strip()
+    if pose_weight not in POSE_MODEL_URLS:
+        pose_weight = "lite"
+    pose_model_url = POSE_MODEL_URLS[pose_weight]
+    pose_model_path = POSE_MODEL_PATHS[pose_weight]
+    print(f"[pose] using pose_landmarker_{pose_weight}")
+    ensure_model(model_url=pose_model_url, model_path=pose_model_path, label=f"Pose Landmarker ({pose_weight})")
     ensure_model(model_url=HAND_MODEL_URL, model_path=HAND_MODEL_PATH, label="Hand Landmarker")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -579,6 +675,7 @@ def main() -> None:
     _pose_dim = int(payload.get("pose_dim", POSE_DIM))
     _hand_dim = int(payload.get("hand_dim", HAND_DIM))
     _hand_mask_dim = int(payload.get("hand_mask_dim", HAND_MASK_DIM))
+    _phone_probe_dim = int(payload.get("phone_probe_dim", 0))
 
     if temporal_model_type == "gru":
         model = FusionTemporalGRU(
@@ -586,6 +683,7 @@ def main() -> None:
             pose_dim=_pose_dim,
             hand_dim=_hand_dim,
             hand_mask_dim=_hand_mask_dim,
+            phone_probe_dim=_phone_probe_dim,
             proj_dim=proj_dim,
             hidden=hidden,
             num_classes=len(labels),
@@ -600,6 +698,7 @@ def main() -> None:
             pose_dim=_pose_dim,
             hand_dim=_hand_dim,
             hand_mask_dim=_hand_mask_dim,
+            phone_probe_dim=_phone_probe_dim,
             proj_dim=proj_dim,
             hidden=hidden,
             num_classes=len(labels),
@@ -616,6 +715,16 @@ def main() -> None:
     )
     clip_model = clip_model.to(device).eval()
 
+    # Encode phone probe text prompts (zero-shot phone detection)
+    if _phone_probe_dim > 0:
+        tokenizer = open_clip.get_tokenizer(clip_model_name)
+        text_tokens = tokenizer(PHONE_PROBE_PROMPTS).to(device)
+        phone_text_feats = clip_model.encode_text(text_tokens).float()
+        phone_text_feats = F.normalize(phone_text_feats, dim=-1)
+        print(f"[phone probe] {len(PHONE_PROBE_PROMPTS)} prompts encoded, dim={_phone_probe_dim}")
+    else:
+        phone_text_feats = None
+
     expected_per_frame_dim = int(payload.get("base_feature_dim", 0))
     expected_total_dim = int(payload.get("feature_dim", feature_dim))
 
@@ -623,7 +732,7 @@ def main() -> None:
         print(f"[warn] clip_feature_dim in ckpt is {_clip_dim} (expected 512)")
 
     if expected_per_frame_dim:
-        implied = _clip_dim + POSE_DIM + HAND_DIM + HAND_MASK_DIM
+        implied = _clip_dim + POSE_DIM + HAND_DIM + HAND_MASK_DIM + _phone_probe_dim
         if implied != expected_per_frame_dim:
             raise SystemExit(
                 f"Checkpoint base_feature_dim mismatch: ckpt={expected_per_frame_dim} implied={implied}"
@@ -640,7 +749,7 @@ def main() -> None:
             )
 
     pose_options = vision.PoseLandmarkerOptions(
-        base_options=base_options.BaseOptions(model_asset_path=POSE_MODEL_PATH),
+        base_options=base_options.BaseOptions(model_asset_path=pose_model_path),
         running_mode=vision.RunningMode.IMAGE,
         min_pose_detection_confidence=0.6,
         min_pose_presence_confidence=0.6,
@@ -692,8 +801,17 @@ def main() -> None:
     ema_alpha = max(0.0, min(1.0, float(args.ema_alpha)))
     print(f"[smoothing] ema_alpha={ema_alpha:.2f} (0=full history, 1=no smoothing)")
 
+    phone_gate = max(0.0, min(1.0, float(args.phone_gate)))
+    # Resolve label indices for phone gating
+    phone_label_idx = labels.index("phone") if "phone" in labels else -1
+    play_phone_label_idx = labels.index("play_phone") if "play_phone" in labels else -1
+    print(f"[phone gate] factor={phone_gate:.2f} phone_idx={phone_label_idx} play_phone_idx={play_phone_label_idx}")
+
     frame_i = 0
     t0 = time.time()
+
+    # Per-stage timing (ms), updated each prediction frame
+    timing_ms: dict[str, float] = {}
 
     try:
         while True:
@@ -710,8 +828,20 @@ def main() -> None:
 
             frame_i += 1
 
-            boxes = get_person_boxes(frame, yolo, args.yolo_conf, args.yolo_iou)
+            if phone_gate < 1.0:
+                _t = time.perf_counter()
+                boxes, phone_boxes = get_person_and_phone_boxes(frame, yolo, args.yolo_conf, args.yolo_iou)
+                timing_ms["yolo"] = (time.perf_counter() - _t) * 1000.0
+            else:
+                _t = time.perf_counter()
+                boxes = get_person_boxes(frame, yolo, args.yolo_conf, args.yolo_iou)
+                timing_ms["yolo"] = (time.perf_counter() - _t) * 1000.0
+                phone_boxes = []
             boxes = boxes[: max(1, int(args.max_people))]
+            has_phone_flags = (
+                [phone_near_person(b, phone_boxes) for b in boxes]
+                if phone_gate < 1.0 else [True] * len(boxes)
+            )
 
             stable_classes = _resize_list(stable_classes, len(boxes), None)
             stable_confs = _resize_list(stable_confs, len(boxes), 0.0)
@@ -738,16 +868,50 @@ def main() -> None:
                     raw_labels: list[str | None] = [None] * len(boxes)
                     if crops:
                         image_t = torch.stack([preprocess(im) for im in crops], dim=0).to(device)
+                        _t = time.perf_counter()
                         frame_clip = clip_model.encode_image(image_t).float()
                         frame_clip = F.normalize(frame_clip, dim=-1)
+                        timing_ms["clip_enc"] = (time.perf_counter() - _t) * 1000.0
+
+                        # Phone probe: cosine similarity with text prompts
+                        if phone_text_feats is not None:
+                            _t = time.perf_counter()
+                            phone_scores = frame_clip @ phone_text_feats.T
+                            timing_ms["phone_probe"] = (time.perf_counter() - _t) * 1000.0
+                        else:
+                            phone_scores = None
 
                         # Update per-person feature histories using current detections.
                         nan_pose = [float("nan")] * POSE_DIM
-                        for j, box_i in enumerate(crop_to_box_i):
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop_rgbs[j]))
 
-                            pose_result = pose_landmarker.detect(mp_image)
-                            hand_result = hand_landmarker.detect(mp_image)
+                        # Prepare all MediaPipe images upfront
+                        mp_images = [
+                            mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop_rgbs[j]))
+                            for j in range(len(crop_to_box_i))
+                        ]
+
+                        # Run pose + hand in parallel per person
+                        def _detect_pose(idx):
+                            return pose_landmarker.detect(mp_images[idx])
+
+                        def _detect_hand(idx):
+                            return hand_landmarker.detect(mp_images[idx])
+
+                        _t_pose = time.perf_counter()
+                        with ThreadPoolExecutor(max_workers=2) as _pool:
+                            pose_futures = [_pool.submit(_detect_pose, j) for j in range(len(crop_to_box_i))]
+                        pose_results = [f.result() for f in pose_futures]
+                        timing_ms["pose_lm"] = (time.perf_counter() - _t_pose) * 1000.0
+
+                        _t_hand = time.perf_counter()
+                        with ThreadPoolExecutor(max_workers=2) as _pool:
+                            hand_futures = [_pool.submit(_detect_hand, j) for j in range(len(crop_to_box_i))]
+                        hand_results = [f.result() for f in hand_futures]
+                        timing_ms["hand_lm"] = (time.perf_counter() - _t_hand) * 1000.0
+
+                        for j, box_i in enumerate(crop_to_box_i):
+                            pose_result = pose_results[j]
+                            hand_result = hand_results[j]
 
                             if pose_result.pose_landmarks:
                                 pose_vec = pose_vector_165(pose_result.pose_landmarks[0])
@@ -766,6 +930,7 @@ def main() -> None:
                                 frame_clip[j].detach().cpu(),
                                 pose_vec,
                                 hand_vec,
+                                phone_probe=phone_scores[j].detach().cpu() if phone_scores is not None else None,
                             )
                             if expected_per_frame_dim and combined.numel() != expected_per_frame_dim:
                                 raise SystemExit(
@@ -789,7 +954,9 @@ def main() -> None:
 
                         if xs:
                             xb = torch.stack(xs, dim=0).to(device)
+                            _t = time.perf_counter()
                             logits = model(xb)
+                            timing_ms["model"] = (time.perf_counter() - _t) * 1000.0
                             probs = torch.softmax(logits, dim=1)
 
                             # EMA temporal smoothing per person
@@ -805,6 +972,14 @@ def main() -> None:
                             for box_i in xs_box_i:
                                 sp = ema_probs[box_i]
                                 if sp is not None:
+                                    # Phone gate: suppress phone/play_phone when no phone detected
+                                    if phone_gate < 1.0 and box_i < len(has_phone_flags) and not has_phone_flags[box_i]:
+                                        sp = sp.clone()
+                                        if phone_label_idx >= 0:
+                                            sp[phone_label_idx] *= phone_gate
+                                        if play_phone_label_idx >= 0:
+                                            sp[play_phone_label_idx] *= phone_gate
+                                        sp = sp / sp.sum()
                                     raw_classes[box_i] = int(sp.argmax().item())
                                     raw_confs[box_i] = float(sp.max().item())
 
@@ -882,12 +1057,28 @@ def main() -> None:
 
             hud_lines = [
                 f"people: {len(boxes)}",
+                f"phones: {sum(1 for f in has_phone_flags if f)} det" if phone_gate < 1.0 else "",
                 f"every: {max(1, int(args.every))}",
                 f"inertia: {max(1, int(args.inertia))}",
                 f"fps: {fps:.1f}",
             ]
+            hud_lines = [s for s in hud_lines if s]
+
+            # Append per-stage latency lines
+            if timing_ms:
+                hud_lines.append("")  # blank separator
+                stage_order = ["yolo", "clip_enc", "pose_lm", "hand_lm", "phone_probe", "model"]
+                total_ms = 0.0
+                for stage in stage_order:
+                    if stage in timing_ms:
+                        ms = timing_ms[stage]
+                        total_ms += ms
+                        hud_lines.append(f"{stage}: {ms:.1f}ms")
+                hud_lines.append(f"total: {total_ms:.1f}ms")
 
             for li, s in enumerate(hud_lines):
+                if not s:
+                    continue
                 cv2.putText(
                     frame,
                     s,

@@ -127,6 +127,7 @@ class FusionTemporalMLP(nn.Module):
         pose_dim: int,
         hand_dim: int,
         hand_mask_dim: int,
+        phone_probe_dim: int = 0,
         proj_dim: int,
         hidden: int,
         num_classes: int,
@@ -139,7 +140,8 @@ class FusionTemporalMLP(nn.Module):
         self.pose_dim = int(pose_dim)
         self.hand_dim = int(hand_dim)
         self.hand_mask_dim = int(hand_mask_dim)
-        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+        self.phone_probe_dim = int(phone_probe_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim + self.phone_probe_dim
 
         self.num_frames = max(1, int(num_frames))
         self.feat_agg = str(feat_agg).lower().strip()
@@ -159,8 +161,10 @@ class FusionTemporalMLP(nn.Module):
         self.pose_proj = _proj(self.pose_dim)
         self.hand_proj = _proj(self.hand_dim)
         self.hand_mask_proj = _proj(self.hand_mask_dim)
+        if self.phone_probe_dim > 0:
+            self.phone_probe_proj = _proj(self.phone_probe_dim)
 
-        self.frame_embed_dim = self.proj_dim * 4
+        self.frame_embed_dim = self.proj_dim * (5 if self.phone_probe_dim > 0 else 4)
 
         if self.feat_agg == "concat":
             head_in = self.frame_embed_dim * self.num_frames
@@ -186,19 +190,27 @@ class FusionTemporalMLP(nn.Module):
                 raise RuntimeError(f"input dim mismatch: got {x.shape[1]} expected {self.per_frame_dim}")
             xf = x.view(x.shape[0], 1, self.per_frame_dim)
 
-        clip = xf[:, :, : self.clip_dim]
-        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
-        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
-        hmask = xf[:, :, -self.hand_mask_dim :]
+        o1 = self.clip_dim
+        o2 = o1 + self.pose_dim
+        o3 = o2 + self.hand_dim
+        o4 = o3 + self.hand_mask_dim
+        clip = xf[:, :, :o1]
+        pose = xf[:, :, o1:o2]
+        hands = xf[:, :, o2:o3]
+        hmask = xf[:, :, o3:o4]
 
-        # project each block per frame
         b, t, _ = xf.shape
         clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
         pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
         hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
         mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
+        parts = [clip_e, pose_e, hand_e, mask_e]
+        if self.phone_probe_dim > 0:
+            phone = xf[:, :, o4:]
+            phone_e = self.phone_probe_proj(phone.reshape(b * t, self.phone_probe_dim))
+            parts.append(phone_e)
 
-        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+        frame_e = torch.cat(parts, dim=1).view(b, t, self.frame_embed_dim)
 
         if self.feat_agg == "concat":
             h = frame_e.reshape(b, t * self.frame_embed_dim)
@@ -227,6 +239,7 @@ class FusionTemporalGRU(nn.Module):
         pose_dim: int,
         hand_dim: int,
         hand_mask_dim: int,
+        phone_probe_dim: int = 0,
         proj_dim: int,
         hidden: int,
         num_classes: int,
@@ -241,7 +254,8 @@ class FusionTemporalGRU(nn.Module):
         self.pose_dim = int(pose_dim)
         self.hand_dim = int(hand_dim)
         self.hand_mask_dim = int(hand_mask_dim)
-        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim
+        self.phone_probe_dim = int(phone_probe_dim)
+        self.per_frame_dim = self.clip_dim + self.pose_dim + self.hand_dim + self.hand_mask_dim + self.phone_probe_dim
         self.num_frames = max(1, int(num_frames))
 
         self.proj_dim = int(proj_dim)
@@ -260,7 +274,9 @@ class FusionTemporalGRU(nn.Module):
         self.pose_proj = _proj(self.pose_dim)
         self.hand_proj = _proj(self.hand_dim)
         self.hand_mask_proj = _proj(self.hand_mask_dim)
-        self.frame_embed_dim = self.proj_dim * 4
+        if self.phone_probe_dim > 0:
+            self.phone_probe_proj = _proj(self.phone_probe_dim)
+        self.frame_embed_dim = self.proj_dim * (5 if self.phone_probe_dim > 0 else 4)
 
         self.gru = nn.GRU(
             input_size=self.frame_embed_dim,
@@ -284,17 +300,26 @@ class FusionTemporalGRU(nn.Module):
 
         xf = x.view(x.shape[0], self.num_frames, self.per_frame_dim)
 
-        clip = xf[:, :, : self.clip_dim]
-        pose = xf[:, :, self.clip_dim : self.clip_dim + self.pose_dim]
-        hands = xf[:, :, self.clip_dim + self.pose_dim : self.clip_dim + self.pose_dim + self.hand_dim]
-        hmask = xf[:, :, -self.hand_mask_dim :]
+        o1 = self.clip_dim
+        o2 = o1 + self.pose_dim
+        o3 = o2 + self.hand_dim
+        o4 = o3 + self.hand_mask_dim
+        clip = xf[:, :, :o1]
+        pose = xf[:, :, o1:o2]
+        hands = xf[:, :, o2:o3]
+        hmask = xf[:, :, o3:o4]
 
         b, t, _ = xf.shape
         clip_e = self.clip_proj(clip.reshape(b * t, self.clip_dim))
         pose_e = self.pose_proj(pose.reshape(b * t, self.pose_dim))
         hand_e = self.hand_proj(hands.reshape(b * t, self.hand_dim))
         mask_e = self.hand_mask_proj(hmask.reshape(b * t, self.hand_mask_dim))
-        frame_e = torch.cat([clip_e, pose_e, hand_e, mask_e], dim=1).view(b, t, self.frame_embed_dim)
+        parts = [clip_e, pose_e, hand_e, mask_e]
+        if self.phone_probe_dim > 0:
+            phone = xf[:, :, o4:]
+            phone_e = self.phone_probe_proj(phone.reshape(b * t, self.phone_probe_dim))
+            parts.append(phone_e)
+        frame_e = torch.cat(parts, dim=1).view(b, t, self.frame_embed_dim)
 
         out, hidden = self.gru(frame_e)
 
@@ -388,6 +413,42 @@ POSE_DIM = 165
 HAND_DIM = 126
 HAND_MASK_DIM = HAND_DIM
 
+PHONE_PROBE_PROMPTS = [
+    "a person holding a cell phone",
+    "a person talking on a phone",
+    "a person looking at a phone screen",
+    "a person with empty hands",
+    "a person waving their hand",
+]
+PHONE_PROBE_DIM = len(PHONE_PROBE_PROMPTS)
+
+
+@torch.inference_mode()
+def compute_phone_probe_scores(
+    clip_feats: np.ndarray,
+    device: str,
+    model_name: str = "ViT-B-32",
+    pretrained: str = "openai",
+) -> np.ndarray:
+    """Cosine similarity between each image's CLIP embedding and phone-probe text prompts.
+
+    clip_feats: (N, 512) L2-normalized CLIP image features.
+    Returns: (N, PHONE_PROBE_DIM) float32 similarity scores.
+    """
+    import open_clip
+
+    model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+    tokenizer = open_clip.get_tokenizer(model_name)
+    model = model.to(device).eval()
+
+    text_tokens = tokenizer(PHONE_PROBE_PROMPTS).to(device)
+    text_feats = model.encode_text(text_tokens).float()
+    text_feats = F.normalize(text_feats, dim=-1)
+
+    clip_t = torch.from_numpy(clip_feats).float().to(device)
+    scores = (clip_t @ text_feats.T).cpu().numpy().astype(np.float32)
+    return scores
+
 
 def _parse_floats(s: str) -> list[float]:
     out: list[float] = []
@@ -436,16 +497,15 @@ def combine_clip_pose_hands_handmask(
     clip_feats: np.ndarray,
     pose: np.ndarray,
     hands: np.ndarray,
+    phone_probe: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (combined_feats, hand_missing_mask) for a single frame.
 
     Per-frame feature is:
-      clip(512) + pose(165) + hands(126) + hand_mask(126)
+      clip(512) + pose(165) + hands(126) + hand_mask(126) [+ phone_probe(P)]
 
     Missing values (NaN) are imputed with 0.
     Mask is ONLY for hands (126 dims): 1 where hand value was missing, else 0.
-
-    No manual weighting here; the model learns per-block mixing.
     """
     clip = clip_feats.astype(np.float32, copy=False)
     pose_imp = np.nan_to_num(pose.astype(np.float32, copy=False), nan=0.0)
@@ -453,7 +513,11 @@ def combine_clip_pose_hands_handmask(
     hand_mask = np.isnan(hands).astype(np.float32)
     hands_imp = np.nan_to_num(hands.astype(np.float32, copy=False), nan=0.0)
 
-    combined = np.concatenate([clip, pose_imp, hands_imp, hand_mask], axis=0).astype(np.float32, copy=False)
+    parts = [clip, pose_imp, hands_imp, hand_mask]
+    if phone_probe is not None:
+        parts.append(phone_probe.astype(np.float32, copy=False))
+
+    combined = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
     return combined, hand_mask
 
 
@@ -576,6 +640,7 @@ def train_model(
     pose_dim: int,
     hand_dim: int,
     hand_mask_dim: int,
+    phone_probe_dim: int = 0,
     proj_dim: int,
     num_frames: int,
     feat_agg: str,
@@ -606,6 +671,7 @@ def train_model(
             pose_dim=int(pose_dim),
             hand_dim=int(hand_dim),
             hand_mask_dim=int(hand_mask_dim),
+            phone_probe_dim=int(phone_probe_dim),
             proj_dim=int(proj_dim),
             hidden=hidden,
             num_classes=len(LABELS_IN_ORDER),
@@ -620,6 +686,7 @@ def train_model(
             pose_dim=int(pose_dim),
             hand_dim=int(hand_dim),
             hand_mask_dim=int(hand_mask_dim),
+            phone_probe_dim=int(phone_probe_dim),
             proj_dim=int(proj_dim),
             hidden=hidden,
             num_classes=len(LABELS_IN_ORDER),
@@ -770,11 +837,16 @@ def main() -> None:
 
     clip_dim = int(feats.shape[1])
 
+    # Compute CLIP zero-shot phone probe scores
+    phone_probe_scores = compute_phone_probe_scores(feats, device)
+    phone_probe_dim = int(phone_probe_scores.shape[1])
+    print(f"Phone probe: {phone_probe_dim} prompts, scores shape={phone_probe_scores.shape}")
+
     marker_dir = Path(args.marker_dir)
     if not marker_dir.exists():
         raise SystemExit(f"Marker dir not found: {marker_dir}")
 
-    # Build per-frame combined features: clip + pose + hands + hand_mask
+    # Build per-frame combined features: clip + pose + hands + hand_mask + phone_probe
     combined_list: list[np.ndarray] = []
     missing_hands_any = 0
 
@@ -793,14 +865,14 @@ def main() -> None:
         if np.isnan(hands).any():
             missing_hands_any += 1
 
-        combined, _hand_mask = combine_clip_pose_hands_handmask(feats[i], pose, hands)
+        combined, _hand_mask = combine_clip_pose_hands_handmask(feats[i], pose, hands, phone_probe_scores[i])
         combined_list.append(combined)
 
     feats_combined = np.stack(combined_list, axis=0).astype(np.float32, copy=False)
     per_frame_dim = int(feats_combined.shape[1])
 
     print(
-        f"Per-frame dims: clip={clip_dim} pose={POSE_DIM} hands={HAND_DIM} hand_mask={HAND_MASK_DIM} => {per_frame_dim} | "
+        f"Per-frame dims: clip={clip_dim} pose={POSE_DIM} hands={HAND_DIM} hand_mask={HAND_MASK_DIM} phone_probe={phone_probe_dim} => {per_frame_dim} | "
         f"frames_with_any_missing_hands={missing_hands_any}/{len(paths)}"
     )
 
@@ -837,6 +909,7 @@ def main() -> None:
         pose_dim=POSE_DIM,
         hand_dim=HAND_DIM,
         hand_mask_dim=HAND_MASK_DIM,
+        phone_probe_dim=phone_probe_dim,
         proj_dim=args.proj_dim,
         num_frames=args.num_frames,
         feat_agg=args.feat_agg,
@@ -862,6 +935,8 @@ def main() -> None:
         "pose_dim": int(POSE_DIM),
         "hand_dim": int(HAND_DIM),
         "hand_mask_dim": int(HAND_MASK_DIM),
+        "phone_probe_dim": phone_probe_dim,
+        "phone_probe_prompts": PHONE_PROBE_PROMPTS,
         "model_type": str(args.temporal_model),
         "base_feature_dim": int(per_frame_dim),
         "feature_dim": int(X.shape[1]),
