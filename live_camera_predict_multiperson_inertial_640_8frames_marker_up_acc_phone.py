@@ -493,9 +493,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--phone-gate",
         type=float,
-        default=0.1,
+        default=0,
         help="When YOLO detects NO phone near a person, multiply phone/play_phone probs by this factor "
-             "(0.0=fully suppress, 1.0=disable gate). Default: 0.1.",
+             "(0.0=fully suppress, 1.0=disable gate). Default: 0.3.",
+    )
+    p.add_argument(
+        "--phone-sticky",
+        type=float,
+        default=0.9,
+        help="Keep phone-detected flag True for this many seconds after last detection (default: 0.5).",
     )
     p.add_argument(
         "--pose-model",
@@ -964,10 +970,13 @@ def main() -> None:
     print(f"[smoothing] ema_alpha={ema_alpha:.2f} (0=full history, 1=no smoothing)")
 
     phone_gate = max(0.0, min(1.0, float(args.phone_gate)))
+    phone_sticky_sec = max(0.0, float(args.phone_sticky))
+    # Per-person timestamp of last phone detection (for sticky flag)
+    phone_last_seen: list[float] = []
     # Resolve label indices for phone gating
     phone_label_idx = labels.index("phone") if "phone" in labels else -1
     play_phone_label_idx = labels.index("play_phone") if "play_phone" in labels else -1
-    print(f"[phone gate] factor={phone_gate:.2f} phone_idx={phone_label_idx} play_phone_idx={play_phone_label_idx}")
+    print(f"[phone gate] factor={phone_gate:.2f} sticky={phone_sticky_sec:.2f}s phone_idx={phone_label_idx} play_phone_idx={play_phone_label_idx}")
 
     frame_i = 0
     t0 = time.time()
@@ -1007,6 +1016,7 @@ def main() -> None:
             pending_counts = _resize_list(pending_counts, len(boxes), 0)
             feat_histories = _resize_histories(feat_histories, len(boxes), max(1, num_frames))
             ema_probs = _resize_list(ema_probs, len(boxes), None)
+            phone_last_seen = _resize_list(phone_last_seen, len(boxes), 0.0)
 
             do_predict = frame_i % max(1, int(args.every)) == 0
             if do_predict:
@@ -1093,6 +1103,14 @@ def main() -> None:
                             )
                             timing_ms["phone_det"] = (time.perf_counter() - _t_phone) * 1000.0
 
+                            # Sticky phone flag: keep True for phone_sticky_sec after last detection
+                            now_ts = time.perf_counter()
+                            for _pi in range(len(has_phone_flags)):
+                                if has_phone_flags[_pi]:
+                                    phone_last_seen[_pi] = now_ts
+                                elif (now_ts - phone_last_seen[_pi]) < phone_sticky_sec:
+                                    has_phone_flags[_pi] = True  # still within sticky window
+
                         # Build full phone_scores: append YOLO detection flag if model expects it
                         _needs_yolo_dim = _phone_probe_dim > len(PHONE_PROBE_PROMPTS)
                         if clip_phone_scores is not None and _needs_yolo_dim:
@@ -1175,7 +1193,9 @@ def main() -> None:
                                             sp[phone_label_idx] *= phone_gate
                                         if play_phone_label_idx >= 0:
                                             sp[play_phone_label_idx] *= phone_gate
-                                        sp = sp / sp.sum()
+                                        denom = sp.sum()
+                                        if denom > 0:
+                                            sp = sp / denom
                                     raw_classes[box_i] = int(sp.argmax().item())
                                     raw_confs[box_i] = float(sp.max().item())
 
