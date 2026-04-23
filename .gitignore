@@ -12,6 +12,7 @@ vlm_mlp/
 
 # Data / generated outputs
 Data-proccessed/
+Data-processed-landmarker/
 crop_frames*/
 random_frames*/
 Train/

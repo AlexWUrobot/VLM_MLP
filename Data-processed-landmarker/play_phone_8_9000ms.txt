@@ -1,8 +1,0 @@
-Pose vector size: 165
-33 pose landmarks × (x,y,z,visibility,presence) = 165
-pose: nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
-
-Hand vector size: 126
-always 2 hands × 21 landmarks/hand × (x,y,z) = 2 × 21 × 3 = 126
-if a hand is missing, its slot is filled with NaN (still length 126).
-hands: 0.262190 0.402548 0.000000 0.273188 0.367896 -0.019527 0.239175 0.341483 -0.020514 0.199595 0.330979 -0.017209 0.169199 0.328915 -0.012598 0.159338 0.346890 -0.009436 0.098562 0.331898 -0.011018 0.064167 0.320126 -0.015736 0.038016 0.310495 -0.019173 0.139074 0.361678 0.001659 0.089783 0.346317 0.002219 0.066267 0.331726 -0.001122 0.050157 0.321802 -0.003753 0.132315 0.373113 0.011921 0.088744 0.356032 0.013875 0.071969 0.342058 0.014690 0.062583 0.332223 0.015725 0.135021 0.380732 0.020045 0.101258 0.364391 0.023523 0.086971 0.352479 0.029060 0.081311 0.344369 0.033967 nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan
