@@ -222,6 +222,11 @@ KP_LWRIST, KP_RWRIST = 9, 10
 LHAND_BASE = 91
 RHAND_BASE = 112
 FINGERTIP_OFFSETS = [4, 8, 12, 16, 20]  # relative to hand base
+# MCP (base) of index=5, middle=9, pinky=17, thumb_tip=4 relative to hand base
+INDEX_MCP_OFF = 5
+PINKY_MCP_OFF = 17
+MIDDLE_MCP_OFF = 9
+THUMB_TIP_OFF = 4
 
 
 def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
@@ -241,28 +246,70 @@ def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
     return float(np.mean(dists))
 
 
+def _palm_facing_camera(
+    kpts: np.ndarray, scores: np.ndarray, hand_base: int,
+    min_score: float = 0.25,
+) -> bool | None:
+    """
+    Determine if the palm faces the camera using 2D hand keypoints.
+
+    Uses the cross product of (wrist→middle_MCP) × (index_MCP→pinky_MCP).
+    For a right hand, palm facing camera: cross > 0  (thumb on viewer's left).
+    For a left hand,  palm facing camera: cross < 0  (mirror).
+    Returns True if palm faces camera, False if back-of-hand faces camera,
+    None if keypoints are insufficient.
+    """
+    wrist_idx = hand_base
+    mid_idx = hand_base + MIDDLE_MCP_OFF
+    idx_idx = hand_base + INDEX_MCP_OFF
+    pin_idx = hand_base + PINKY_MCP_OFF
+
+    needed = [wrist_idx, mid_idx, idx_idx, pin_idx]
+    if any(scores[i] < min_score for i in needed):
+        return None
+
+    # Vector A: wrist → middle finger MCP  (roughly up the hand)
+    A = kpts[mid_idx] - kpts[wrist_idx]
+    # Vector B: index MCP → pinky MCP  (across the palm)
+    B = kpts[pin_idx] - kpts[idx_idx]
+
+    cross_z = float(A[0] * B[1] - A[1] * B[0])  # z-component of 2D cross
+
+    # For right hand (base=112): palm-facing-camera → cross < 0
+    # For left hand  (base=91):  palm-facing-camera → cross > 0
+    if hand_base == RHAND_BASE:
+        return cross_z < 0
+    else:
+        return cross_z > 0
+
+
 class WristTracker:
-    """Per-person-slot wrist position + hand scale history."""
+    """Per-person-slot wrist position + hand scale + palm orientation history."""
 
     def __init__(self, max_history: int = 15):
         self.max_history = max_history
-        self._pos_hist: list[deque] = []   # (x, y) wrist positions
-        self._scale_hist: list[deque] = [] # hand scale (finger spread)
+        self._pos_hist: list[deque] = []     # (x, y) wrist positions
+        self._scale_hist: list[deque] = []   # hand scale (finger spread)
+        self._palm_hist: list[deque] = []    # bool: palm facing camera?
 
     def resize(self, n: int):
         while len(self._pos_hist) < n:
             self._pos_hist.append(deque(maxlen=self.max_history))
             self._scale_hist.append(deque(maxlen=self.max_history))
+            self._palm_hist.append(deque(maxlen=self.max_history))
         self._pos_hist = self._pos_hist[:n]
         self._scale_hist = self._scale_hist[:n]
+        self._palm_hist = self._palm_hist[:n]
 
     def update(self, idx: int, xy: tuple[float, float] | None,
-              scale: float | None):
+              scale: float | None, palm_facing: bool | None):
         if 0 <= idx < len(self._pos_hist):
             if xy is not None:
                 self._pos_hist[idx].append(xy)
             if scale is not None:
                 self._scale_hist[idx].append(scale)
+            if palm_facing is not None:
+                self._palm_hist[idx].append(palm_facing)
 
     def get_pos(self, idx: int) -> list[tuple[float, float]]:
         if 0 <= idx < len(self._pos_hist):
@@ -274,9 +321,15 @@ class WristTracker:
             return list(self._scale_hist[idx])
         return []
 
+    def get_palm(self, idx: int) -> list[bool]:
+        if 0 <= idx < len(self._palm_hist):
+            return list(self._palm_hist[idx])
+        return []
+
     def clear_all(self):
         self._pos_hist.clear()
         self._scale_hist.clear()
+        self._palm_hist.clear()
 
 
 def _dominant_wrist(
@@ -302,17 +355,22 @@ def _dominant_wrist(
 def classify_hand_gesture(
     wrist_history: list[tuple[float, float]],
     scale_history: list[float],
+    palm_history: list[bool],
     bbox_h: float,
 ) -> int | None:
     """
-    Classify stop / wave / come from wrist trajectory + hand scale change.
+    Classify stop / wave / come from wrist trajectory + palm orientation.
 
-    Hand scale (avg fingertip-to-wrist distance) acts as a depth proxy:
-      - scale increasing  → hand moving TOWARD camera  → stop
-      - scale decreasing  → hand moving AWAY from camera → come
-      - lateral oscillation (x-dir reversals)            → wave
+    Primary signal — palm orientation (from RTMW hand keypoints):
+      - palm facing camera  → stop  or  wave
+      - palm facing away    → come  (beckoning gesture, back of hand visible)
+
+    Secondary signals:
+      - lateral oscillation (x-dir reversals) + palm facing → wave
+      - palm facing camera + still or forward push          → stop
+      - hand scale shrinking (moving away)                  → come
     """
-    MIN_FRAMES = 6
+    MIN_FRAMES = 5
     if len(wrist_history) < MIN_FRAMES:
         return None
 
@@ -330,33 +388,44 @@ def classify_hand_gesture(
     x_dir_changes = int(np.sum(np.abs(np.diff(nonzero)) > 0)) if len(nonzero) > 1 else 0
     x_range = float(np.ptp(pts[:, 0])) / norm
 
-    # wave: lateral oscillation
-    if x_dir_changes >= 2 and x_range > 0.04:
+    is_oscillating = x_dir_changes >= 2 and x_range > 0.03
+
+    # ── Palm orientation vote (majority of recent frames) ──
+    palm_facing = None  # True = palm toward camera, False = away
+    if len(palm_history) >= 3:
+        recent = palm_history[-10:]
+        n_facing = sum(recent)
+        palm_facing = n_facing > len(recent) * 0.5
+
+    # ── Decision tree ──
+    if palm_facing is not None:
+        if not palm_facing:
+            # Back of hand visible → COME (beckoning)
+            return COME_IDX
+        else:
+            # Palm facing camera → WAVE or STOP
+            if is_oscillating:
+                return WAVE_IDX
+            return STOP_IDX
+
+    # ── Fallback when palm orientation unavailable: use scale + motion ──
+    if is_oscillating:
         return WAVE_IDX
 
-    # Use hand scale (finger spread) to detect depth direction
     if len(scale_history) >= MIN_FRAMES:
         scales = np.array(scale_history[-15:])
-        # Linear trend of scale over recent frames
-        t = np.arange(len(scales), dtype=np.float32)
-        # Normalised slope: positive = growing (toward camera), negative = shrinking (away)
         if len(scales) >= 3:
+            t = np.arange(len(scales), dtype=np.float32)
             slope = float(np.polyfit(t, scales, 1)[0])
             mean_scale = float(np.mean(scales))
-            # Normalise slope by mean scale to get relative rate
             rel_slope = slope / max(mean_scale, 1.0)
-
-            # come: hand moving away from camera → scale shrinking or roughly stable
-            #       rel_slope < threshold (can be slightly negative or near zero with motion)
-            # stop: hand moving toward camera → scale growing, or hand held still
             if avg_speed < 0.012:
-                return STOP_IDX  # hand truly still → stop
+                return STOP_IDX
             if rel_slope > 0.01:
-                return STOP_IDX  # hand growing → moving toward camera
+                return STOP_IDX
             else:
-                return COME_IDX  # hand shrinking or stable + movement → beckoning
+                return COME_IDX
 
-    # Fallback: low motion = stop, any motion = come
     if avg_speed < 0.015:
         return STOP_IDX
     return COME_IDX
@@ -508,7 +577,8 @@ def main() -> None:
                 kpts, kscores = rtmw.postprocess(outs, warp)
                 wrist_xy, hbase = _dominant_wrist(kpts, kscores)
                 scale = _hand_scale(kpts, kscores, hbase) if hbase is not None else None
-                wrist_tracker.update(bi, wrist_xy, scale)
+                palm = _palm_facing_camera(kpts, kscores, hbase) if hbase is not None else None
+                wrist_tracker.update(bi, wrist_xy, scale, palm)
             except Exception:
                 pass
 
@@ -552,6 +622,7 @@ def main() -> None:
                             gesture = classify_hand_gesture(
                                 wrist_tracker.get_pos(bi_idx),
                                 wrist_tracker.get_scale(bi_idx),
+                                wrist_tracker.get_palm(bi_idx),
                                 bh,
                             )
                             if gesture is not None:
