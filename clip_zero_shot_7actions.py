@@ -92,16 +92,8 @@ TEXT_PROMPTS: dict[str, list[str]] = {
         "a person raising hand above head and waving",
         "a person waving with arm fully extended overhead",
     ],
-    "small_love": [
-        "a person making a small finger heart gesture with thumb and index finger",
-        "a person crossing thumb tip and index fingertip to form a tiny heart",
-        "a person holding up a Korean finger heart sign",
-    ],
-    "middle_finger": [
-        "a person showing their middle finger",
-        "a person giving the finger gesture",
-        "a person flipping the bird with hand raised",
-    ],
+    "small_love": [],
+    "middle_finger": [],
 }
 
 # Display names override: internal label → on-screen text
@@ -400,7 +392,7 @@ MIDFINGER_IDX = LABELS.index("middle_finger")  # 10
 HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX, HIGH_WAVE_IDX}
 
 # ── Feature toggles ──────────────────────────────────────────────────
-ENABLE_SMALL_LOVE = False     # Set False to disable small_love detection
+ENABLE_SMALL_LOVE = True     # Set False to disable small_love detection
 ENABLE_MIDDLE_FINGER = False  # Set False to disable middle_finger detection
 
 # RTMW body keypoint for head reference (nose)
@@ -527,7 +519,7 @@ def _detect_finger_heart(
     if hand_sc < min_hand_scale_px:
         return False
     tip_dist = float(np.linalg.norm(kpts[thumb_tip] - kpts[idx_tip]))
-    if tip_dist / hand_sc > 0.38:  # tips must be very close relative to hand size
+    if tip_dist / hand_sc > 0.50:  # tips must be close relative to hand size
         return False
 
     # 2. Index tip should be at or above thumb tip (lower y = higher in image)
@@ -548,9 +540,9 @@ def _detect_finger_heart(
             continue
         tip_to_wrist = float(np.linalg.norm(kpts[ftip] - kpts[wrist]))
         pip_to_wrist = float(np.linalg.norm(kpts[fpip] - kpts[wrist]))
-        if tip_to_wrist < pip_to_wrist * 1.05:
+        if tip_to_wrist < pip_to_wrist * 1.15:
             curled_count += 1
-    if curled_count < 3:  # all 3 remaining fingers must be curled
+    if curled_count < 3:  # at least 2 of 3 remaining fingers must be curled
         return False
 
     return True
@@ -624,7 +616,7 @@ def _detect_middle_finger(
     # 1. Middle finger must be extended: tip is far from wrist and above MCP
     mid_tip_to_wrist = float(np.linalg.norm(kpts[mid_tip] - kpts[wrist]))
     mid_mcp_to_wrist = float(np.linalg.norm(kpts[mid_mcp] - kpts[wrist]))
-    if mid_tip_to_wrist < mid_mcp_to_wrist * 1.4:
+    if mid_tip_to_wrist < mid_mcp_to_wrist * 1.25:
         return False  # middle finger not extended enough
     # Middle tip should be above (lower y) its MCP
     if kpts[mid_tip, 1] > kpts[mid_mcp, 1]:
@@ -643,34 +635,28 @@ def _detect_middle_finger(
     # Where does the true middle MCP project?  (should be ~0.3-0.5)
     mcp_frac = float(np.dot(kpts[mid_mcp] - kpts[idx_mcp], palm_vec)) / palm_len_sq
     # The tip must be near the middle MCP position (within ±0.25)
-    if abs(tip_frac - mcp_frac) > 0.25:
+    if abs(tip_frac - mcp_frac) > 0.35:
         return False  # tip is physically at wrong finger position
     # Reject if tip projects outside the plausible middle-finger zone [0.15, 0.65]
     if tip_frac < 0.15 or tip_frac > 0.65:
         return False  # too far to index side or pinky side
 
-    # 1b. Index finger must NOT be extended (rejects thumb+index poses
-    #     where RTMW swaps index/middle keypoints).
-    if scores[idx_tip] >= min_score and scores[idx_mcp] >= min_score:
-        if kpts[idx_tip, 1] < kpts[idx_mcp, 1]:  # index tip above MCP → extended
-            return False
-
-    # 1c. Thumb must NOT be extended.
+    # 1b. Thumb must NOT be extended.
     if scores[thumb_tip] >= min_score:
         thumb_dist = float(np.linalg.norm(kpts[thumb_tip] - kpts[wrist]))
-        if thumb_dist > hand_sc * 0.65:
+        if thumb_dist > hand_sc * 0.75:
             return False  # thumb looks extended
         # Also reject if thumb tip is above its IP joint (pointing up)
         if scores[thumb_ip] >= min_score and kpts[thumb_tip, 1] < kpts[thumb_ip, 1] - 3:
             return False
 
-    # 1d. Middle fingertip must be the HIGHEST point (lowest y) among all
+    # 1c. Middle fingertip must be the HIGHEST point (lowest y) among all
     #     visible fingertips.
     mid_y = float(kpts[mid_tip, 1])
     for otip in [idx_tip, ring_tip, pink_tip, thumb_tip]:
         if scores[otip] < min_score:
             continue
-        if float(kpts[otip, 1]) < mid_y - 3.0:  # 3px tolerance
+        if float(kpts[otip, 1]) < mid_y - 8.0:  # 8px tolerance
             return False  # another fingertip is higher → not middle finger
 
     # 2. Adjacent fingers (index & ring) MUST be visible and clearly shorter.
@@ -678,7 +664,7 @@ def _detect_middle_finger(
         if scores[adj_tip] < min_score:
             return False  # can't verify adjacent finger is curled → reject
         adj_dist = float(np.linalg.norm(kpts[adj_tip] - kpts[wrist]))
-        if adj_dist >= mid_tip_to_wrist * 0.70:
+        if adj_dist >= mid_tip_to_wrist * 0.75:
             return False  # adjacent finger too extended
 
     # 3. ALL other fingertips: verify at least 3 are visibly shorter.
@@ -688,10 +674,10 @@ def _detect_middle_finger(
         if scores[otip] < min_score:
             continue
         other_dist = float(np.linalg.norm(kpts[otip] - kpts[wrist]))
-        if other_dist >= mid_tip_to_wrist * 0.80:
+        if other_dist >= mid_tip_to_wrist * 0.85:
             return False  # another finger is similarly or more extended
         verified_shorter += 1
-    if verified_shorter < 3:
+    if verified_shorter < 2:
         return False  # can't confirm enough fingers are shorter
 
     # 4. Other fingers must be curled (tip closer to wrist than their PIP)
@@ -709,7 +695,7 @@ def _detect_middle_finger(
         pip_dist = float(np.linalg.norm(kpts[fpip] - kpts[wrist]))
         if tip_dist < pip_dist * 1.2:
             curled += 1
-    if curled < 3:  # at least 3 of 4 non-middle fingers must be curled
+    if curled < 2:  # at least 2 of 4 non-middle fingers must be curled
         return False
 
     return True
@@ -976,7 +962,7 @@ def main() -> None:
     head_y_per_person: list[float | None] = []  # per-person nose y-coordinate (updated each frame)
     small_love_per_person: list[bool] = []  # per-person: finger-heart detected this frame
     small_love_history: list[deque] = []     # per-person: rolling window of last 10 detections
-    SMALL_LOVE_CONFIRM_FRAMES = 8            # need 8/10 recent frames positive
+    SMALL_LOVE_CONFIRM_FRAMES = 5            # need 5/10 recent frames positive
     small_love_hold_until: list[float] = []  # per-person timestamp until which "small_love" is held
     SMALL_LOVE_HOLD_SEC = 0.4
     midfinger_per_person: list[bool] = []   # per-person: middle finger detected this frame
@@ -1073,7 +1059,7 @@ def main() -> None:
                         diffs = np.diff(pts, axis=0)
                         speeds = np.linalg.norm(diffs, axis=1) / max(bh, 1.0)
                         avg_speed = float(np.mean(speeds))
-                        if avg_speed > 0.012:  # hand moving too fast → reject
+                        if avg_speed > 0.020:  # hand moving too fast → reject
                             fh_detected = False
                     else:
                         fh_detected = False  # not enough history yet
@@ -1082,32 +1068,13 @@ def main() -> None:
                 small_love_history[bi].append(fh_detected)
                 if fh_detected and sum(small_love_history[bi]) < SMALL_LOVE_CONFIRM_FRAMES:
                     small_love_per_person[bi] = False  # not enough consecutive evidence
-                # Check both hands for middle finger (Jerin)
-                # Step 1: RTMW pose check
-                mf_hand_base = None
+                # Check both hands for middle finger (Jerin) — RTMW only
+                mf_detected = False
                 if _detect_middle_finger(kpts, kscores, LHAND_BASE):
-                    mf_hand_base = LHAND_BASE
+                    mf_detected = True
                 elif _detect_middle_finger(kpts, kscores, RHAND_BASE):
-                    mf_hand_base = RHAND_BASE
-                # Step 2: CLIP visual double-check on hand crop
-                mf_confirmed = False
-                if mf_hand_base is not None:
-                    h_fr, w_fr = frame.shape[:2]
-                    hbox = _hand_bbox(kpts, kscores, mf_hand_base, h_fr, w_fr)
-                    if hbox is not None:
-                        hx1, hy1, hx2, hy2 = hbox
-                        hand_crop = cv2.cvtColor(frame[hy1:hy2, hx1:hx2], cv2.COLOR_BGR2RGB)
-                        if hand_crop.size > 0:
-                            hand_pil = Image.fromarray(hand_crop)
-                            hand_t = preprocess(hand_pil).unsqueeze(0).to(device)
-                            hand_feat = clip_model.encode_image(hand_t).float()
-                            hand_feat = F.normalize(hand_feat, dim=-1)
-                            hand_sims = (hand_feat @ text_feats.T).squeeze(0)
-                            hand_probs = torch.softmax(hand_sims * 100.0, dim=0)
-                            midfinger_conf = float(hand_probs[MIDFINGER_IDX])
-                            if midfinger_conf > 0.60:
-                                mf_confirmed = True
-                midfinger_per_person[bi] = mf_confirmed and ENABLE_MIDDLE_FINGER
+                    mf_detected = True
+                midfinger_per_person[bi] = mf_detected and ENABLE_MIDDLE_FINGER
             except Exception:
                 pass
 
