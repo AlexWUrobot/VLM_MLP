@@ -561,13 +561,22 @@ def _detect_middle_finger(
     if tip_frac < 0.15 or tip_frac > 0.65:
         return False  # too far to index side or pinky side
 
-    # 1b. Thumb must NOT be extended (rejects thumbs-up at any angle).
+    # 1b. Index finger must NOT be extended (rejects thumb+index poses
+    #     where RTMW swaps index/middle keypoints).
+    if scores[idx_tip] >= min_score and scores[idx_mcp] >= min_score:
+        if kpts[idx_tip, 1] < kpts[idx_mcp, 1]:  # index tip above MCP → extended
+            return False
+
+    # 1c. Thumb must NOT be extended.
     if scores[thumb_tip] >= min_score:
         thumb_dist = float(np.linalg.norm(kpts[thumb_tip] - kpts[wrist]))
-        if thumb_dist > hand_sc * 0.80:
-            return False  # thumb looks extended → likely thumbs-up
+        if thumb_dist > hand_sc * 0.65:
+            return False  # thumb looks extended
+        # Also reject if thumb tip is above its IP joint (pointing up)
+        if scores[thumb_ip] >= min_score and kpts[thumb_tip, 1] < kpts[thumb_ip, 1] - 3:
+            return False
 
-    # 1c. Middle fingertip must be the HIGHEST point (lowest y) among all
+    # 1d. Middle fingertip must be the HIGHEST point (lowest y) among all
     #     visible fingertips.
     mid_y = float(kpts[mid_tip, 1])
     for otip in [idx_tip, ring_tip, pink_tip, thumb_tip]:
@@ -878,6 +887,8 @@ def main() -> None:
     HIGH_WAVE_CONFIRM_SEC = 0.25
     head_y_per_person: list[float | None] = []  # per-person nose y-coordinate (updated each frame)
     small_love_per_person: list[bool] = []  # per-person: finger-heart detected this frame
+    small_love_history: list[deque] = []     # per-person: rolling window of last 10 detections
+    SMALL_LOVE_CONFIRM_FRAMES = 8            # need 8/10 recent frames positive
     small_love_hold_until: list[float] = []  # per-person timestamp until which "small_love" is held
     SMALL_LOVE_HOLD_SEC = 0.4
     midfinger_per_person: list[bool] = []   # per-person: middle finger detected this frame
@@ -930,6 +941,9 @@ def main() -> None:
         high_wave_first_seen = _resize_list(high_wave_first_seen, len(boxes), 0.0)
         head_y_per_person = _resize_list(head_y_per_person, len(boxes), None)
         small_love_per_person = _resize_list(small_love_per_person, len(boxes), False)
+        while len(small_love_history) < len(boxes):
+            small_love_history.append(deque(maxlen=10))
+        small_love_history = small_love_history[:len(boxes)]
         small_love_hold_until = _resize_list(small_love_hold_until, len(boxes), 0.0)
         midfinger_per_person = _resize_list(midfinger_per_person, len(boxes), False)
         midfinger_hold_until = _resize_list(midfinger_hold_until, len(boxes), 0.0)
@@ -970,6 +984,10 @@ def main() -> None:
                     else:
                         fh_detected = False  # not enough history yet
                 small_love_per_person[bi] = fh_detected
+                # Update rolling history and only confirm if 8/10 recent frames
+                small_love_history[bi].append(fh_detected)
+                if fh_detected and sum(small_love_history[bi]) < SMALL_LOVE_CONFIRM_FRAMES:
+                    small_love_per_person[bi] = False  # not enough consecutive evidence
                 # Check both hands for middle finger (Jerin)
                 # Step 1: RTMW pose check
                 mf_hand_base = None
@@ -1147,6 +1165,7 @@ def main() -> None:
                 high_wave_first_seen = []
                 head_y_per_person = []
                 small_love_per_person = []
+                small_love_history = []
                 small_love_hold_until = []
                 midfinger_per_person = []
                 midfinger_hold_until = []
