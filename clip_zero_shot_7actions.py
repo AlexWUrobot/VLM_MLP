@@ -39,6 +39,7 @@ LABELS = [
     "take a picture",
     "idle",
     "love",
+    "high_wave",
 ]
 
 # Multiple prompts per class to improve zero-shot accuracy
@@ -83,6 +84,11 @@ TEXT_PROMPTS: dict[str, list[str]] = {
         "a person forming a love heart sign with both hands above their head",
         "a person making a finger heart gesture",
         "a person crossing arms above head to form a big heart shape",
+    ],
+    "high_wave": [
+        "a person waving their hand high above their head",
+        "a person raising hand above head and waving",
+        "a person waving with arm fully extended overhead",
     ],
 }
 
@@ -201,6 +207,7 @@ LABEL_COLORS: dict[str, tuple[int, int, int]] = {
     "take a picture": (255, 200, 0),  # cyan-ish
     "idle":           (180, 180, 180),# grey
     "love":           (255, 0, 255),  # magenta
+    "high_wave":      (0, 255, 255),  # yellow
 }
 
 MIN_DISPLAY_CONF = 0.15  # show label only above this similarity
@@ -213,7 +220,11 @@ COME_IDX = LABELS.index("come")      # 0
 WAVE_IDX = LABELS.index("wave")      # 1
 STOP_IDX = LABELS.index("stop")      # 2
 IDLE_IDX = LABELS.index("idle")      # 6
-HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX}
+HIGH_WAVE_IDX = LABELS.index("high_wave")  # 8
+HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX, HIGH_WAVE_IDX}
+
+# RTMW body keypoint for head reference (nose)
+KP_NOSE = 0
 
 # RTMW body keypoint indices
 KP_LWRIST, KP_RWRIST = 9, 10
@@ -535,9 +546,14 @@ def main() -> None:
     come_hold_until: list[float] = []  # per-person timestamp until which "come" is held
     COME_HOLD_SEC = 0.55
     wave_hold_until: list[float] = []   # per-person timestamp until which "wave" is held
-    WAVE_HOLD_SEC = 0.3
+    WAVE_HOLD_SEC = 0.55
     wave_first_seen: list[float] = []   # per-person: when wave was first continuously detected
     WAVE_CONFIRM_SEC = 0.25              # must see wave for this long before displaying
+    high_wave_hold_until: list[float] = []  # per-person timestamp until which "high_wave" is held
+    HIGH_WAVE_HOLD_SEC = 0.3
+    high_wave_first_seen: list[float] = []  # per-person: when high_wave was first continuously detected
+    HIGH_WAVE_CONFIRM_SEC = 0.25
+    head_y_per_person: list[float | None] = []  # per-person nose y-coordinate (updated each frame)
     print("[INFO] RTMW loaded for hand-gesture refinement")
 
     # ── open camera ──────────────────────────────────────────────────
@@ -578,6 +594,9 @@ def main() -> None:
         come_hold_until = _resize_list(come_hold_until, len(boxes), 0.0)
         wave_hold_until = _resize_list(wave_hold_until, len(boxes), 0.0)
         wave_first_seen = _resize_list(wave_first_seen, len(boxes), 0.0)
+        high_wave_hold_until = _resize_list(high_wave_hold_until, len(boxes), 0.0)
+        high_wave_first_seen = _resize_list(high_wave_first_seen, len(boxes), 0.0)
+        head_y_per_person = _resize_list(head_y_per_person, len(boxes), None)
 
         # ── RTMW wrist tracking (every frame for smooth motion) ─────
         wrist_tracker.resize(len(boxes))
@@ -590,6 +609,11 @@ def main() -> None:
                 scale = _hand_scale(kpts, kscores, hbase) if hbase is not None else None
                 palm = _palm_facing_camera(kpts, kscores, hbase) if hbase is not None else None
                 wrist_tracker.update(bi, wrist_xy, scale, palm)
+                # Track head (nose) y-coordinate for high_wave detection
+                if kscores[KP_NOSE] >= 0.3:
+                    head_y_per_person[bi] = float(kpts[KP_NOSE, 1])
+                else:
+                    head_y_per_person[bi] = None
             except Exception:
                 pass
 
@@ -651,18 +675,43 @@ def main() -> None:
                                 bh,
                             )
                             if gesture is not None:
+                                # Check if wrist is at or above head level
+                                wrist_above_head = False
+                                nose_y = head_y_per_person[bi_idx] if bi_idx < len(head_y_per_person) else None
+                                wrist_positions = wrist_tracker.get_pos(bi_idx)
+                                if nose_y is not None and wrist_positions:
+                                    wrist_y = wrist_positions[-1][1]
+                                    # "around head" margin: 15% of bbox height
+                                    margin = bh * 0.15
+                                    wrist_above_head = wrist_y <= nose_y + margin
+
                                 if gesture == COME_IDX:
                                     come_hold_until[bi_idx] = now + COME_HOLD_SEC
                                     raw_classes[bi_idx] = COME_IDX
                                     wave_first_seen[bi_idx] = 0.0
+                                    high_wave_first_seen[bi_idx] = 0.0
                                 elif now < come_hold_until[bi_idx]:
                                     # Hold come for duration after last trigger
                                     raw_classes[bi_idx] = COME_IDX
+                                elif now < high_wave_hold_until[bi_idx]:
+                                    # Hold high_wave for duration after last trigger
+                                    raw_classes[bi_idx] = HIGH_WAVE_IDX
                                 elif now < wave_hold_until[bi_idx]:
                                     # Hold wave for duration after last trigger
                                     raw_classes[bi_idx] = WAVE_IDX
+                                elif gesture == WAVE_IDX and wrist_above_head:
+                                    # High wave: oscillating + hand at/above head
+                                    if high_wave_first_seen[bi_idx] == 0.0:
+                                        high_wave_first_seen[bi_idx] = now
+                                    if now - high_wave_first_seen[bi_idx] >= HIGH_WAVE_CONFIRM_SEC:
+                                        high_wave_hold_until[bi_idx] = now + HIGH_WAVE_HOLD_SEC
+                                        raw_classes[bi_idx] = HIGH_WAVE_IDX
+                                        wave_first_seen[bi_idx] = 0.0
+                                    else:
+                                        raw_classes[bi_idx] = IDLE_IDX
                                 elif gesture == WAVE_IDX:
-                                    # Wave confirmation: need 0.3s continuous
+                                    # Normal wave: oscillating, hand NOT above head
+                                    high_wave_first_seen[bi_idx] = 0.0
                                     if wave_first_seen[bi_idx] == 0.0:
                                         wave_first_seen[bi_idx] = now
                                     if now - wave_first_seen[bi_idx] >= WAVE_CONFIRM_SEC:
@@ -670,8 +719,15 @@ def main() -> None:
                                         raw_classes[bi_idx] = WAVE_IDX
                                     else:
                                         raw_classes[bi_idx] = IDLE_IDX
+                                elif gesture == STOP_IDX and wrist_above_head:
+                                    # Hand still at head level – check if actually oscillating
+                                    # (stop with hand above head stays stop)
+                                    raw_classes[bi_idx] = STOP_IDX
+                                    wave_first_seen[bi_idx] = 0.0
+                                    high_wave_first_seen[bi_idx] = 0.0
                                 else:
                                     wave_first_seen[bi_idx] = 0.0
+                                    high_wave_first_seen[bi_idx] = 0.0
                                     raw_classes[bi_idx] = gesture
 
                 stable_classes, pending_classes, pending_counts = _apply_inertia(
@@ -687,6 +743,9 @@ def main() -> None:
                 come_hold_until = []
                 wave_hold_until = []
                 wave_first_seen = []
+                high_wave_hold_until = []
+                high_wave_first_seen = []
+                head_y_per_person = []
 
         # ── draw ─────────────────────────────────────────────────────
         for i, (x1, y1, x2, y2) in enumerate(boxes):
