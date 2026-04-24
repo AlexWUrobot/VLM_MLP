@@ -212,6 +212,7 @@ MIN_DISPLAY_CONF = 0.15  # show label only above this similarity
 COME_IDX = LABELS.index("come")      # 0
 WAVE_IDX = LABELS.index("wave")      # 1
 STOP_IDX = LABELS.index("stop")      # 2
+IDLE_IDX = LABELS.index("idle")      # 6
 HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX}
 
 # RTMW body keypoint indices
@@ -408,11 +409,8 @@ def classify_hand_gesture(
             # Back of hand visible → COME if scale shrinking (even slowly)
             if scale_shrinking:
                 return COME_IDX
-            # Palm away but hand still → stop
-            if avg_speed < 0.015:
-                return STOP_IDX
-            # Palm away + some motion but not clearly shrinking → stop
-            return STOP_IDX
+            # Palm away but hand still → idle (not stop)
+            return IDLE_IDX
         else:
             # Palm facing camera → WAVE or STOP
             if is_oscillating:
@@ -535,7 +533,7 @@ def main() -> None:
     rtmw_outs = [o.name for o in rtmw_sess.get_outputs()]
     wrist_tracker = WristTracker(max_history=15)
     come_hold_until: list[float] = []  # per-person timestamp until which "come" is held
-    COME_HOLD_SEC = 0.5
+    COME_HOLD_SEC = 0.2
     print("[INFO] RTMW loaded for hand-gesture refinement")
 
     # ── open camera ──────────────────────────────────────────────────
