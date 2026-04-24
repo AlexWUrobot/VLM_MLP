@@ -199,6 +199,7 @@ def get_person_boxes(frame_bgr, yolo_model, yolo_conf: float) -> list[tuple[int,
     if getattr(r, "boxes", None) is None or len(r.boxes) == 0:
         return []
     h, w = frame_bgr.shape[:2]
+    min_area = h * w * 0.01  # at least 1% of frame area
     boxes, areas = [], []
     for box in r.boxes:
         if box.xyxy is None or len(box.xyxy) == 0:
@@ -207,12 +208,95 @@ def get_person_boxes(frame_bgr, yolo_model, yolo_conf: float) -> list[tuple[int,
         x1, y1 = max(0, int(x1f)), max(0, int(y1f))
         x2, y2 = min(w, int(x2f)), min(h, int(y2f))
         area = max(0, x2 - x1) * max(0, y2 - y1)
-        if area <= 0:
+        if area < min_area:
             continue
         boxes.append((x1, y1, x2, y2))
         areas.append(area)
     order = sorted(range(len(boxes)), key=lambda i: areas[i], reverse=True)
     return [boxes[i] for i in order]
+
+
+def _iou(a: tuple[int,int,int,int], b: tuple[int,int,int,int]) -> float:
+    """Intersection-over-union of two (x1,y1,x2,y2) boxes."""
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    aa = (a[2]-a[0])*(a[3]-a[1])
+    ab = (b[2]-b[0])*(b[3]-b[1])
+    return inter / max(aa + ab - inter, 1)
+
+
+BOX_EMA_ALPHA = 0.4   # 0 = full smoothing, 1 = no smoothing
+BOX_MISSING_FRAMES = 3  # keep box alive for N frames if person disappears
+
+
+def _smooth_boxes(
+    raw_boxes: list[tuple[int,int,int,int]],
+    prev_smooth: list[tuple[float,float,float,float]],
+    prev_miss: list[int],
+    alpha: float = BOX_EMA_ALPHA,
+) -> tuple[
+    list[tuple[int,int,int,int]],       # smoothed boxes (int, for drawing)
+    list[tuple[float,float,float,float]], # smoothed state (float, for next frame)
+    list[int],                            # miss counters
+]:
+    """Match raw detections to previous smoothed boxes via IoU, then EMA."""
+    n_prev = len(prev_smooth)
+    n_raw = len(raw_boxes)
+    matched_prev = [False] * n_prev
+    matched_raw = [False] * n_raw
+
+    # Greedy IoU matching: best pairs first
+    pairs = []
+    for pi in range(n_prev):
+        for ri in range(n_raw):
+            iou = _iou(
+                (int(prev_smooth[pi][0]), int(prev_smooth[pi][1]),
+                 int(prev_smooth[pi][2]), int(prev_smooth[pi][3])),
+                raw_boxes[ri],
+            )
+            if iou > 0.3:
+                pairs.append((iou, pi, ri))
+    pairs.sort(key=lambda x: x[0], reverse=True)
+
+    out_boxes: list[tuple[int,int,int,int]] = []
+    out_smooth: list[tuple[float,float,float,float]] = []
+    out_miss: list[int] = []
+
+    for _, pi, ri in pairs:
+        if matched_prev[pi] or matched_raw[ri]:
+            continue
+        matched_prev[pi] = True
+        matched_raw[ri] = True
+        # EMA blend
+        sx = prev_smooth[pi][0] * (1 - alpha) + raw_boxes[ri][0] * alpha
+        sy = prev_smooth[pi][1] * (1 - alpha) + raw_boxes[ri][1] * alpha
+        sx2 = prev_smooth[pi][2] * (1 - alpha) + raw_boxes[ri][2] * alpha
+        sy2 = prev_smooth[pi][3] * (1 - alpha) + raw_boxes[ri][3] * alpha
+        out_smooth.append((sx, sy, sx2, sy2))
+        out_boxes.append((int(round(sx)), int(round(sy)), int(round(sx2)), int(round(sy2))))
+        out_miss.append(0)
+
+    # Unmatched previous boxes: keep alive for a few frames
+    for pi in range(n_prev):
+        if matched_prev[pi]:
+            continue
+        if prev_miss[pi] < BOX_MISSING_FRAMES:
+            out_smooth.append(prev_smooth[pi])
+            out_boxes.append((int(round(prev_smooth[pi][0])), int(round(prev_smooth[pi][1])),
+                              int(round(prev_smooth[pi][2])), int(round(prev_smooth[pi][3]))))
+            out_miss.append(prev_miss[pi] + 1)
+
+    # New detections (no match to previous)
+    for ri in range(n_raw):
+        if matched_raw[ri]:
+            continue
+        b = raw_boxes[ri]
+        out_smooth.append((float(b[0]), float(b[1]), float(b[2]), float(b[3])))
+        out_boxes.append(b)
+        out_miss.append(0)
+
+    return out_boxes, out_smooth, out_miss
 
 
 LABEL_COLORS: dict[str, tuple[int, int, int]] = {
@@ -314,6 +398,10 @@ HIGH_WAVE_IDX = LABELS.index("high_wave")  # 8
 SMALL_LOVE_IDX = LABELS.index("small_love")  # 9
 MIDFINGER_IDX = LABELS.index("middle_finger")  # 10
 HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX, HIGH_WAVE_IDX}
+
+# ── Feature toggles ──────────────────────────────────────────────────
+ENABLE_SMALL_LOVE = False     # Set False to disable small_love detection
+ENABLE_MIDDLE_FINGER = False  # Set False to disable middle_finger detection
 
 # RTMW body keypoint for head reference (nose)
 KP_NOSE = 0
@@ -916,6 +1004,9 @@ def main() -> None:
     stable_confs: list[float] = []
     pending_classes: list[int | None] = []
     pending_counts: list[int] = []
+    # Bbox smoothing state
+    _smooth_state: list[tuple[float,float,float,float]] = []
+    _miss_counts: list[int] = []
 
     frame_i = 0
     t0 = time.time()
@@ -927,8 +1018,11 @@ def main() -> None:
         frame_i += 1
 
         # ── YOLO person detection ───────────────────────────────────
-        boxes = get_person_boxes(frame, yolo, args.yolo_conf)
-        boxes = boxes[: max(1, int(args.max_people))]
+        raw_boxes = get_person_boxes(frame, yolo, args.yolo_conf)
+        raw_boxes = raw_boxes[: max(1, int(args.max_people))]
+        boxes, _smooth_state, _miss_counts = _smooth_boxes(
+            raw_boxes, _smooth_state, _miss_counts,
+        )
 
         stable_classes = _resize_list(stable_classes, len(boxes), None)
         stable_confs = _resize_list(stable_confs, len(boxes), 0.0)
@@ -983,7 +1077,7 @@ def main() -> None:
                             fh_detected = False
                     else:
                         fh_detected = False  # not enough history yet
-                small_love_per_person[bi] = fh_detected
+                small_love_per_person[bi] = fh_detected and ENABLE_SMALL_LOVE
                 # Update rolling history and only confirm if 8/10 recent frames
                 small_love_history[bi].append(fh_detected)
                 if fh_detected and sum(small_love_history[bi]) < SMALL_LOVE_CONFIRM_FRAMES:
@@ -1013,7 +1107,7 @@ def main() -> None:
                             midfinger_conf = float(hand_probs[MIDFINGER_IDX])
                             if midfinger_conf > 0.60:
                                 mf_confirmed = True
-                midfinger_per_person[bi] = mf_confirmed
+                midfinger_per_person[bi] = mf_confirmed and ENABLE_MIDDLE_FINGER
             except Exception:
                 pass
 
@@ -1062,14 +1156,22 @@ def main() -> None:
                             if raw_confs[bi_idx] < LOW_CONF_THRESHOLD:
                                 raw_classes[bi_idx] = IDLE_IDX
 
+                    # ── suppress disabled gesture classes ──
+                    for bi_idx in range(len(raw_classes)):
+                        cls = raw_classes[bi_idx]
+                        if cls == SMALL_LOVE_IDX and not ENABLE_SMALL_LOVE:
+                            raw_classes[bi_idx] = IDLE_IDX
+                        if cls == MIDFINGER_IDX and not ENABLE_MIDDLE_FINGER:
+                            raw_classes[bi_idx] = IDLE_IDX
+
                     # ── refine stop / wave / come via wrist motion ──
                     now = time.time()
                     for bi_idx in range(len(raw_classes)):
                         # ── 1. Hold check (unconditional – overrides CLIP) ──
-                        if now < midfinger_hold_until[bi_idx]:
+                        if ENABLE_MIDDLE_FINGER and now < midfinger_hold_until[bi_idx]:
                             raw_classes[bi_idx] = MIDFINGER_IDX
                             continue
-                        if now < small_love_hold_until[bi_idx]:
+                        if ENABLE_SMALL_LOVE and now < small_love_hold_until[bi_idx]:
                             raw_classes[bi_idx] = SMALL_LOVE_IDX
                             continue
                         if now < come_hold_until[bi_idx]:
@@ -1157,6 +1259,7 @@ def main() -> None:
             else:
                 stable_classes, stable_confs = [], []
                 pending_classes, pending_counts = [], []
+                _smooth_state, _miss_counts = [], []
                 wrist_tracker.clear_all()
                 come_hold_until = []
                 wave_hold_until = []
