@@ -1,6 +1,6 @@
 """
-Zero-shot action recognition from a webcam using CLIP ViT-B-32.
-Recognises 7 motions:
+Zero-shot action recognition from a webcam using CLIP ViT-B-32 + RTMW pose.
+Recognises 8 motions:
   1. come        – beckoning / waving someone closer
   2. wave        – waving hand as greeting
   3. stop        – palm facing forward, halt gesture
@@ -8,14 +8,19 @@ Recognises 7 motions:
   5. phone call  – holding phone to ear
   6. take a picture – holding up phone / camera to take a photo
   7. idle        – standing / doing nothing
+  8. love        – finger heart or arm heart gesture
 
-Uses YOLO to crop the closest person, then CLIP text–image similarity
-to pick the best matching action.  Press 'q' or ESC to quit.
+CLIP picks the broad action class.  When CLIP predicts stop/wave/come,
+RTMW wrist-motion tracking refines the prediction by analysing hand
+trajectory (still → stop, oscillating → wave, other movement → come).
+
+Press 'q' or ESC to quit.
 """
 
 import argparse
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -33,6 +38,7 @@ LABELS = [
     "phone call",
     "take a picture",
     "idle",
+    "love",
 ]
 
 # Multiple prompts per class to improve zero-shot accuracy
@@ -72,6 +78,12 @@ TEXT_PROMPTS: dict[str, list[str]] = {
         "a person standing with arms at their sides",
         "a person standing idle",
     ],
+    "love": [
+        "a person making a heart shape with their fingers",
+        "a person forming a love heart sign with both hands above their head",
+        "a person making a finger heart gesture",
+        "a person crossing arms above head to form a big heart shape",
+    ],
 }
 
 
@@ -97,7 +109,13 @@ def parse_args() -> argparse.Namespace:
         "--inertia", type=int, default=3,
         help="Change label only after N consecutive identical predictions (1 = disable)",
     )
-    p.add_argument("--window", default="CLIP 7-Action Recognition", help="OpenCV window name")
+    p.add_argument("--width", type=int, default=640, help="Camera capture width (default 1280)")
+    p.add_argument("--height", type=int, default=480, help="Camera capture height (default 720)")
+    p.add_argument("--fps", type=int, default=30, help="Camera capture FPS (default 30)")
+    p.add_argument("--no-trt", action="store_true", help="Disable TensorRT for RTMW, use CUDA EP")
+    p.add_argument("--rtmw-model", default=None, help="Path to RTMW ONNX model (auto-download if omitted)")
+    p.add_argument("--bbox-pad", type=float, default=1.25, help="Bbox padding ratio for RTMW crop")
+    p.add_argument("--window", default="CLIP 8-Action Recognition", help="OpenCV window name")
     return p.parse_args()
 
 
@@ -182,9 +200,100 @@ LABEL_COLORS: dict[str, tuple[int, int, int]] = {
     "phone call":     (0, 165, 255),  # orange
     "take a picture": (255, 200, 0),  # cyan-ish
     "idle":           (180, 180, 180),# grey
+    "love":           (255, 0, 255),  # magenta
 }
 
 MIN_DISPLAY_CONF = 0.15  # show label only above this similarity
+
+
+# ── RTMW hand-gesture refinement ─────────────────────────────────────
+# When CLIP predicts stop / wave / come, use wrist motion to disambiguate.
+
+COME_IDX = LABELS.index("come")      # 0
+WAVE_IDX = LABELS.index("wave")      # 1
+STOP_IDX = LABELS.index("stop")      # 2
+HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX}
+
+# RTMW body keypoint indices
+KP_LWRIST, KP_RWRIST = 9, 10
+
+
+class WristTracker:
+    """Per-person-slot wrist position history."""
+
+    def __init__(self, max_history: int = 15):
+        self.max_history = max_history
+        self._hist: list[deque] = []
+
+    def resize(self, n: int):
+        while len(self._hist) < n:
+            self._hist.append(deque(maxlen=self.max_history))
+        self._hist = self._hist[:n]
+
+    def update(self, idx: int, xy: tuple[float, float] | None):
+        if 0 <= idx < len(self._hist) and xy is not None:
+            self._hist[idx].append(xy)
+
+    def get(self, idx: int) -> list[tuple[float, float]]:
+        if 0 <= idx < len(self._hist):
+            return list(self._hist[idx])
+        return []
+
+    def clear_all(self):
+        self._hist.clear()
+
+
+def _dominant_wrist(
+    kpts: np.ndarray, scores: np.ndarray, min_score: float = 0.3,
+) -> tuple[float, float] | None:
+    """Return (x, y) of the raised (higher) wrist, or None."""
+    lw_ok = scores[KP_LWRIST] >= min_score
+    rw_ok = scores[KP_RWRIST] >= min_score
+    if lw_ok and rw_ok:
+        idx = KP_LWRIST if kpts[KP_LWRIST, 1] < kpts[KP_RWRIST, 1] else KP_RWRIST
+    elif lw_ok:
+        idx = KP_LWRIST
+    elif rw_ok:
+        idx = KP_RWRIST
+    else:
+        return None
+    return (float(kpts[idx, 0]), float(kpts[idx, 1]))
+
+
+def classify_hand_gesture(
+    wrist_history: list[tuple[float, float]], bbox_h: float,
+) -> int | None:
+    """
+    Classify stop / wave / come from wrist trajectory.
+
+    stop  -> hand nearly still (low avg speed)
+    wave  -> lateral oscillation (>=2 x-direction reversals + wide x range)
+    come  -> moderate movement, not lateral oscillation (beckoning)
+    """
+    MIN_FRAMES = 6
+    if len(wrist_history) < MIN_FRAMES:
+        return None
+
+    pts = np.array(wrist_history[-15:])
+    norm = max(bbox_h, 1.0)
+
+    diffs = np.diff(pts, axis=0)
+    speeds = np.linalg.norm(diffs, axis=1) / norm
+    avg_speed = float(np.mean(speeds))
+
+    # x-direction reversals -> oscillation count
+    dx = diffs[:, 0]
+    signs = np.sign(dx)
+    nonzero = signs[signs != 0]
+    x_dir_changes = int(np.sum(np.abs(np.diff(nonzero)) > 0)) if len(nonzero) > 1 else 0
+
+    x_range = float(np.ptp(pts[:, 0])) / norm
+
+    if avg_speed < 0.015:
+        return STOP_IDX
+    if x_dir_changes >= 2 and x_range > 0.04:
+        return WAVE_IDX
+    return COME_IDX
 
 
 @torch.inference_mode()
@@ -278,11 +387,27 @@ def main() -> None:
     yolo = YOLO(args.yolo)
     print(f"[INFO] YOLO loaded: {args.yolo}")
 
+    # ── load RTMW for hand gesture refinement ────────────────────────
+    import RTMW_detector_acc as rtmw
+
+    rtmw_path = args.rtmw_model or rtmw.ensure_rtmw_model()
+    rtmw_sess = rtmw.create_session(rtmw_path, use_trt=not args.no_trt)
+    rtmw_in = rtmw_sess.get_inputs()[0].name
+    rtmw_outs = [o.name for o in rtmw_sess.get_outputs()]
+    wrist_tracker = WristTracker(max_history=15)
+    print("[INFO] RTMW loaded for hand-gesture refinement")
+
     # ── open camera ──────────────────────────────────────────────────
     cap = cv2.VideoCapture(args.camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
     if not cap.isOpened():
         raise SystemExit(f"Cannot open camera {args.camera}")
-    print(f"[INFO] Camera {args.camera} opened. Press 'q' or ESC to quit.")
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"[INFO] Camera {args.camera}: {actual_w}x{actual_h} @ {actual_fps:.0f}fps. Press 'q' or ESC to quit.")
 
     # ── per-person tracking state ────────────────────────────────────
     stable_classes: list[int | None] = []
@@ -307,6 +432,17 @@ def main() -> None:
         stable_confs = _resize_list(stable_confs, len(boxes), 0.0)
         pending_classes = _resize_list(pending_classes, len(boxes), None)
         pending_counts = _resize_list(pending_counts, len(boxes), 0)
+
+        # ── RTMW wrist tracking (every frame for smooth motion) ─────
+        wrist_tracker.resize(len(boxes))
+        for bi, (x1, y1, x2, y2) in enumerate(boxes):
+            try:
+                inp, warp = rtmw.preprocess(frame, (x1, y1, x2, y2), args.bbox_pad)
+                outs = rtmw_sess.run(rtmw_outs, {rtmw_in: inp})
+                kpts, kscores = rtmw.postprocess(outs, warp)
+                wrist_tracker.update(bi, _dominant_wrist(kpts, kscores))
+            except Exception:
+                pass
 
         do_predict = (frame_i % max(1, int(args.every))) == 0
         if do_predict:
@@ -340,6 +476,17 @@ def main() -> None:
                         raw_classes[bi] = int(pred)
                         raw_confs[bi] = float(conf)
 
+                    # ── refine stop / wave / come via wrist motion ──
+                    for bi_idx in range(len(raw_classes)):
+                        cls = raw_classes[bi_idx]
+                        if cls is not None and cls in HAND_GESTURE_SET:
+                            bh = boxes[bi_idx][3] - boxes[bi_idx][1]
+                            gesture = classify_hand_gesture(
+                                wrist_tracker.get(bi_idx), bh,
+                            )
+                            if gesture is not None:
+                                raw_classes[bi_idx] = gesture
+
                 stable_classes, pending_classes, pending_counts = _apply_inertia(
                     raw_classes, stable_classes, pending_classes, pending_counts, args.inertia,
                 )
@@ -349,6 +496,7 @@ def main() -> None:
             else:
                 stable_classes, stable_confs = [], []
                 pending_classes, pending_counts = [], []
+                wrist_tracker.clear_all()
 
         # ── draw ─────────────────────────────────────────────────────
         for i, (x1, y1, x2, y2) in enumerate(boxes):
