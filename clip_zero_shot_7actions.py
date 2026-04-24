@@ -40,6 +40,7 @@ LABELS = [
     "idle",
     "love",
     "high_wave",
+    "small_love",
 ]
 
 # Multiple prompts per class to improve zero-shot accuracy
@@ -89,6 +90,11 @@ TEXT_PROMPTS: dict[str, list[str]] = {
         "a person waving their hand high above their head",
         "a person raising hand above head and waving",
         "a person waving with arm fully extended overhead",
+    ],
+    "small_love": [
+        "a person making a small finger heart gesture with thumb and index finger",
+        "a person crossing thumb tip and index fingertip to form a tiny heart",
+        "a person holding up a Korean finger heart sign",
     ],
 }
 
@@ -208,9 +214,81 @@ LABEL_COLORS: dict[str, tuple[int, int, int]] = {
     "idle":           (180, 180, 180),# grey
     "love":           (255, 0, 255),  # magenta
     "high_wave":      (0, 255, 255),  # yellow
+    "small_love":     (255, 105, 180),# pink
 }
 
 MIN_DISPLAY_CONF = 0.15  # show label only above this similarity
+
+LOVE_IDX = LABELS.index("love")
+
+# ── Heart animation helpers ──────────────────────────────────────────
+ANIM_DURATION = 2.0  # seconds
+
+import math as _math
+
+
+def _heart_contour(cx: int, cy: int, size: float) -> np.ndarray:
+    """Return a heart-shaped contour centred at (cx, cy) with given size."""
+    t = np.linspace(0, 2 * _math.pi, 80)
+    x = 16 * np.sin(t) ** 3
+    y = -(13 * np.cos(t) - 5 * np.cos(2 * t) - 2 * np.cos(3 * t) - np.cos(4 * t))
+    scale = size / 32.0  # raw heart is ~32 units wide
+    pts = np.column_stack([x * scale + cx, y * scale + cy]).astype(np.int32)
+    return pts.reshape((-1, 1, 2))
+
+
+def _draw_heart(frame: np.ndarray, cx: int, cy: int, size: float,
+                color: tuple[int, int, int], alpha: float = 1.0) -> None:
+    """Draw a filled heart with optional transparency on *frame*."""
+    if alpha <= 0 or size < 2:
+        return
+    contour = _heart_contour(cx, cy, size)
+    if alpha >= 0.95:
+        cv2.fillPoly(frame, [contour], color, cv2.LINE_AA)
+    else:
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [contour], color, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+
+def _draw_love_animation(frame: np.ndarray, cx: int, cy: int,
+                         bbox_h: int, progress: float) -> None:
+    """Single large heart: scale up then fade out. progress ∈ [0, 1]."""
+    # Phase 1 (0→0.4): grow from 0 to full size, full opacity
+    # Phase 2 (0.4→1): stay full size, fade out
+    max_size = bbox_h * 0.6
+    if progress < 0.4:
+        t = progress / 0.4
+        size = max_size * t
+        alpha = 1.0
+    else:
+        t = (progress - 0.4) / 0.6
+        size = max_size
+        alpha = 1.0 - t
+    _draw_heart(frame, cx, cy, size, (180, 0, 255), alpha)
+
+
+def _draw_small_love_animation(frame: np.ndarray, cx: int, bot_y: int,
+                               bbox_h: int, progress: float) -> None:
+    """Multiple small hearts floating upward. progress ∈ [0, 1]."""
+    # Use fixed seed offsets for deterministic but varied positions
+    _offsets = [(-0.25, 0.0), (0.15, 0.12), (-0.10, 0.25), (0.25, 0.38),
+                (-0.20, 0.50), (0.10, 0.62), (0.0, 0.75)]
+    heart_size = bbox_h * 0.08
+    travel = bbox_h * 1.2  # how far hearts travel upward
+
+    for dx_frac, delay in _offsets:
+        t = progress - delay * 0.5  # staggered start
+        if t < 0 or t > 1:
+            continue
+        # Float upward
+        y = int(bot_y - t * travel)
+        x = int(cx + dx_frac * bbox_h * 0.5)
+        # Fade out near end
+        alpha = 1.0 - max(0.0, (t - 0.6) / 0.4)
+        # Slight size pulse
+        s = heart_size * (0.8 + 0.4 * _math.sin(t * _math.pi))
+        _draw_heart(frame, x, y, s, (180, 105, 255), alpha)
 
 
 # ── RTMW hand-gesture refinement ─────────────────────────────────────
@@ -221,6 +299,7 @@ WAVE_IDX = LABELS.index("wave")      # 1
 STOP_IDX = LABELS.index("stop")      # 2
 IDLE_IDX = LABELS.index("idle")      # 6
 HIGH_WAVE_IDX = LABELS.index("high_wave")  # 8
+SMALL_LOVE_IDX = LABELS.index("small_love")  # 9
 HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX, HIGH_WAVE_IDX}
 
 # RTMW body keypoint for head reference (nose)
@@ -239,6 +318,19 @@ INDEX_MCP_OFF = 5
 PINKY_MCP_OFF = 17
 MIDDLE_MCP_OFF = 9
 THUMB_TIP_OFF = 4
+
+# Additional hand keypoint offsets for finger-heart (small_love) detection
+# Per-hand 21 keypoints: 0=wrist, 1–4=thumb, 5–8=index, 9–12=middle, 13–16=ring, 17–20=pinky
+# Tip offsets: thumb=4, index=8, middle=12, ring=16, pinky=20
+# PIP (proximal interphalangeal) offsets: index=6, middle=10, ring=14, pinky=18
+INDEX_TIP_OFF = 8
+MIDDLE_TIP_OFF = 12
+RING_TIP_OFF = 16
+PINKY_TIP_OFF = 20
+INDEX_PIP_OFF = 6
+MIDDLE_PIP_OFF = 10
+RING_PIP_OFF = 14
+PINKY_PIP_OFF = 18
 
 
 def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
@@ -293,6 +385,66 @@ def _palm_facing_camera(
         return cross_z < 0
     else:
         return cross_z > 0
+
+
+def _detect_finger_heart(
+    kpts: np.ndarray, scores: np.ndarray, hand_base: int,
+    min_score: float = 0.25,
+    min_hand_scale_px: float = 60.0,
+) -> bool:
+    """
+    Detect the Korean finger-heart (small love) gesture using 2D hand keypoints.
+
+    Criteria:
+      0. Hand must be close to camera (hand_scale >= min_hand_scale_px pixels).
+      1. Thumb tip and index fingertip are very close (touching / crossing).
+      2. Index tip y ≤ thumb tip y (index crosses over thumb, forming a V).
+      3. Middle, ring, and pinky fingers are curled (tip closer to wrist than PIP).
+    """
+    thumb_tip = hand_base + THUMB_TIP_OFF
+    idx_tip = hand_base + INDEX_TIP_OFF
+    mid_tip = hand_base + MIDDLE_TIP_OFF
+    ring_tip = hand_base + RING_TIP_OFF
+    pink_tip = hand_base + PINKY_TIP_OFF
+    mid_pip = hand_base + MIDDLE_PIP_OFF
+    ring_pip = hand_base + RING_PIP_OFF
+    pink_pip = hand_base + PINKY_PIP_OFF
+    wrist = hand_base  # offset 0
+
+    # Need thumb tip, index tip, and wrist with decent confidence
+    essential = [thumb_tip, idx_tip, wrist]
+    if any(scores[i] < min_score for i in essential):
+        return False
+
+    # 1. Thumb tip ↔ index tip proximity (normalised by hand size)
+    hand_sc = _hand_scale(kpts, scores, hand_base, min_score)
+    if hand_sc is None or hand_sc < 1.0:
+        return False
+    # 0. Hand must be large enough in frame (close to camera)
+    if hand_sc < min_hand_scale_px:
+        return False
+    tip_dist = float(np.linalg.norm(kpts[thumb_tip] - kpts[idx_tip]))
+    if tip_dist / hand_sc > 0.55:  # tips must be close relative to hand size
+        return False
+
+    # 2. Index tip should be at or above thumb tip (lower y = higher in image)
+    #    Allow a small tolerance downward (20% of hand scale)
+    if kpts[idx_tip, 1] > kpts[thumb_tip, 1] + hand_sc * 0.2:
+        return False
+
+    # 3. Other fingers curled: tip closer to wrist than PIP is
+    curled_count = 0
+    for ftip, fpip in [(mid_tip, mid_pip), (ring_tip, ring_pip), (pink_tip, pink_pip)]:
+        if scores[ftip] < min_score or scores[fpip] < min_score:
+            continue
+        tip_to_wrist = float(np.linalg.norm(kpts[ftip] - kpts[wrist]))
+        pip_to_wrist = float(np.linalg.norm(kpts[fpip] - kpts[wrist]))
+        if tip_to_wrist < pip_to_wrist * 1.15:
+            curled_count += 1
+    if curled_count < 2:  # at least 2 of 3 fingers must be curled
+        return False
+
+    return True
 
 
 class WristTracker:
@@ -554,6 +706,12 @@ def main() -> None:
     high_wave_first_seen: list[float] = []  # per-person: when high_wave was first continuously detected
     HIGH_WAVE_CONFIRM_SEC = 0.25
     head_y_per_person: list[float | None] = []  # per-person nose y-coordinate (updated each frame)
+    small_love_per_person: list[bool] = []  # per-person: finger-heart detected this frame
+    small_love_hold_until: list[float] = []  # per-person timestamp until which "small_love" is held
+    SMALL_LOVE_HOLD_SEC = 0.4
+    # Per-person heart animation state
+    anim_type: list[str | None] = []    # None / "love" / "small_love"
+    anim_start: list[float] = []        # timestamp when animation started
     print("[INFO] RTMW loaded for hand-gesture refinement")
 
     # ── open camera ──────────────────────────────────────────────────
@@ -597,6 +755,10 @@ def main() -> None:
         high_wave_hold_until = _resize_list(high_wave_hold_until, len(boxes), 0.0)
         high_wave_first_seen = _resize_list(high_wave_first_seen, len(boxes), 0.0)
         head_y_per_person = _resize_list(head_y_per_person, len(boxes), None)
+        small_love_per_person = _resize_list(small_love_per_person, len(boxes), False)
+        small_love_hold_until = _resize_list(small_love_hold_until, len(boxes), 0.0)
+        anim_type = _resize_list(anim_type, len(boxes), None)
+        anim_start = _resize_list(anim_start, len(boxes), 0.0)
 
         # ── RTMW wrist tracking (every frame for smooth motion) ─────
         wrist_tracker.resize(len(boxes))
@@ -614,6 +776,24 @@ def main() -> None:
                     head_y_per_person[bi] = float(kpts[KP_NOSE, 1])
                 else:
                     head_y_per_person[bi] = None
+                # Check both hands for finger-heart (small_love)
+                fh_left = _detect_finger_heart(kpts, kscores, LHAND_BASE)
+                fh_right = _detect_finger_heart(kpts, kscores, RHAND_BASE)
+                fh_detected = fh_left or fh_right
+                # Only accept if hand is nearly still (low wrist speed)
+                if fh_detected:
+                    bh = y2 - y1
+                    pos_hist = wrist_tracker.get_pos(bi)
+                    if len(pos_hist) >= 3:
+                        pts = np.array(pos_hist[-10:])
+                        diffs = np.diff(pts, axis=0)
+                        speeds = np.linalg.norm(diffs, axis=1) / max(bh, 1.0)
+                        avg_speed = float(np.mean(speeds))
+                        if avg_speed > 0.012:  # hand moving too fast → reject
+                            fh_detected = False
+                    else:
+                        fh_detected = False  # not enough history yet
+                small_love_per_person[bi] = fh_detected
             except Exception:
                 pass
 
@@ -666,6 +846,9 @@ def main() -> None:
                     now = time.time()
                     for bi_idx in range(len(raw_classes)):
                         # ── 1. Hold check (unconditional – overrides CLIP) ──
+                        if now < small_love_hold_until[bi_idx]:
+                            raw_classes[bi_idx] = SMALL_LOVE_IDX
+                            continue
                         if now < come_hold_until[bi_idx]:
                             raw_classes[bi_idx] = COME_IDX
                             continue
@@ -674,6 +857,12 @@ def main() -> None:
                             continue
                         if now < wave_hold_until[bi_idx]:
                             raw_classes[bi_idx] = WAVE_IDX
+                            continue
+
+                        # ── 1b. Finger-heart override (pose-based, any CLIP class) ──
+                        if small_love_per_person[bi_idx]:
+                            small_love_hold_until[bi_idx] = now + SMALL_LOVE_HOLD_SEC
+                            raw_classes[bi_idx] = SMALL_LOVE_IDX
                             continue
 
                         # ── 2. Gesture refinement (only for hand-gesture classes) ──
@@ -748,8 +937,13 @@ def main() -> None:
                 high_wave_hold_until = []
                 high_wave_first_seen = []
                 head_y_per_person = []
+                small_love_per_person = []
+                small_love_hold_until = []
+                anim_type = []
+                anim_start = []
 
         # ── draw ─────────────────────────────────────────────────────
+        now_draw = time.time()
         for i, (x1, y1, x2, y2) in enumerate(boxes):
             cls = stable_classes[i] if i < len(stable_classes) else None
             conf = stable_confs[i] if i < len(stable_confs) else 0.0
@@ -771,6 +965,35 @@ def main() -> None:
                 ty = max(th + 4, y1 - 8)
                 cv2.putText(frame, text, (x1, ty),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+            # ── trigger / update heart animations ──
+            if cls == LOVE_IDX:
+                if anim_type[i] != "love":
+                    anim_type[i] = "love"
+                    anim_start[i] = now_draw
+            elif cls == SMALL_LOVE_IDX:
+                if anim_type[i] != "small_love":
+                    anim_type[i] = "small_love"
+                    anim_start[i] = now_draw
+            else:
+                # Don't clear mid-animation — let it finish naturally
+                pass
+
+            # ── render heart animation ──
+            if anim_type[i] is not None and anim_start[i] > 0:
+                elapsed = now_draw - anim_start[i]
+                if elapsed < ANIM_DURATION:
+                    progress = elapsed / ANIM_DURATION
+                    bh = y2 - y1
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    if anim_type[i] == "love":
+                        _draw_love_animation(frame, cx, cy, bh, progress)
+                    elif anim_type[i] == "small_love":
+                        _draw_small_love_animation(frame, cx, y2, bh, progress)
+                else:
+                    anim_type[i] = None
+                    anim_start[i] = 0.0
 
         # HUD
         dt = time.time() - t0
