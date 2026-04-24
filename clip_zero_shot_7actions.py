@@ -665,6 +665,18 @@ def main() -> None:
                     # ── refine stop / wave / come via wrist motion ──
                     now = time.time()
                     for bi_idx in range(len(raw_classes)):
+                        # ── 1. Hold check (unconditional – overrides CLIP) ──
+                        if now < come_hold_until[bi_idx]:
+                            raw_classes[bi_idx] = COME_IDX
+                            continue
+                        if now < high_wave_hold_until[bi_idx]:
+                            raw_classes[bi_idx] = HIGH_WAVE_IDX
+                            continue
+                        if now < wave_hold_until[bi_idx]:
+                            raw_classes[bi_idx] = WAVE_IDX
+                            continue
+
+                        # ── 2. Gesture refinement (only for hand-gesture classes) ──
                         cls = raw_classes[bi_idx]
                         if cls is not None and cls in HAND_GESTURE_SET:
                             bh = boxes[bi_idx][3] - boxes[bi_idx][1]
@@ -690,15 +702,6 @@ def main() -> None:
                                     raw_classes[bi_idx] = COME_IDX
                                     wave_first_seen[bi_idx] = 0.0
                                     high_wave_first_seen[bi_idx] = 0.0
-                                elif now < come_hold_until[bi_idx]:
-                                    # Hold come for duration after last trigger
-                                    raw_classes[bi_idx] = COME_IDX
-                                elif now < high_wave_hold_until[bi_idx]:
-                                    # Hold high_wave for duration after last trigger
-                                    raw_classes[bi_idx] = HIGH_WAVE_IDX
-                                elif now < wave_hold_until[bi_idx]:
-                                    # Hold wave for duration after last trigger
-                                    raw_classes[bi_idx] = WAVE_IDX
                                 elif gesture == WAVE_IDX and wrist_above_head:
                                     # High wave: oscillating + hand at/above head
                                     if high_wave_first_seen[bi_idx] == 0.0:
@@ -720,8 +723,7 @@ def main() -> None:
                                     else:
                                         raw_classes[bi_idx] = IDLE_IDX
                                 elif gesture == STOP_IDX and wrist_above_head:
-                                    # Hand still at head level – check if actually oscillating
-                                    # (stop with hand above head stays stop)
+                                    # Hand still at head level (not oscillating → stop)
                                     raw_classes[bi_idx] = STOP_IDX
                                     wave_first_seen[bi_idx] = 0.0
                                     high_wave_first_seen[bi_idx] = 0.0
