@@ -533,9 +533,11 @@ def main() -> None:
     rtmw_outs = [o.name for o in rtmw_sess.get_outputs()]
     wrist_tracker = WristTracker(max_history=15)
     come_hold_until: list[float] = []  # per-person timestamp until which "come" is held
-    COME_HOLD_SEC = 0.2
+    COME_HOLD_SEC = 0.55
+    wave_hold_until: list[float] = []   # per-person timestamp until which "wave" is held
+    WAVE_HOLD_SEC = 0.3
     wave_first_seen: list[float] = []   # per-person: when wave was first continuously detected
-    WAVE_CONFIRM_SEC = 0.3              # must see wave for this long before displaying
+    WAVE_CONFIRM_SEC = 0.25              # must see wave for this long before displaying
     print("[INFO] RTMW loaded for hand-gesture refinement")
 
     # ── open camera ──────────────────────────────────────────────────
@@ -574,6 +576,7 @@ def main() -> None:
         pending_classes = _resize_list(pending_classes, len(boxes), None)
         pending_counts = _resize_list(pending_counts, len(boxes), 0)
         come_hold_until = _resize_list(come_hold_until, len(boxes), 0.0)
+        wave_hold_until = _resize_list(wave_hold_until, len(boxes), 0.0)
         wave_first_seen = _resize_list(wave_first_seen, len(boxes), 0.0)
 
         # ── RTMW wrist tracking (every frame for smooth motion) ─────
@@ -655,11 +658,15 @@ def main() -> None:
                                 elif now < come_hold_until[bi_idx]:
                                     # Hold come for duration after last trigger
                                     raw_classes[bi_idx] = COME_IDX
+                                elif now < wave_hold_until[bi_idx]:
+                                    # Hold wave for duration after last trigger
+                                    raw_classes[bi_idx] = WAVE_IDX
                                 elif gesture == WAVE_IDX:
                                     # Wave confirmation: need 0.3s continuous
                                     if wave_first_seen[bi_idx] == 0.0:
                                         wave_first_seen[bi_idx] = now
                                     if now - wave_first_seen[bi_idx] >= WAVE_CONFIRM_SEC:
+                                        wave_hold_until[bi_idx] = now + WAVE_HOLD_SEC
                                         raw_classes[bi_idx] = WAVE_IDX
                                     else:
                                         raw_classes[bi_idx] = IDLE_IDX
@@ -678,6 +685,7 @@ def main() -> None:
                 pending_classes, pending_counts = [], []
                 wrist_tracker.clear_all()
                 come_hold_until = []
+                wave_hold_until = []
                 wave_first_seen = []
 
         # ── draw ─────────────────────────────────────────────────────
