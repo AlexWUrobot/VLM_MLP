@@ -500,7 +500,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--phone-sticky",
         type=float,
-        default=0.9,
+        default=0.7,
         help="Keep phone-detected flag True for this many seconds after last detection (default: 0.5).",
     )
     p.add_argument(
@@ -744,7 +744,7 @@ def detect_phones_in_hand_crops(
     frame_bgr,
     hand_bboxes_per_person: list[list[tuple[int, int, int, int]]],
     yolo_model,
-    conf: float = 0.25,
+    conf: float = 0.1,
 ) -> list[bool]:
     """Run YOLO phone detection on hand-region crops.
 
