@@ -216,59 +216,101 @@ HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX}
 
 # RTMW body keypoint indices
 KP_LWRIST, KP_RWRIST = 9, 10
+# RTMW hand keypoint offsets (21 per hand)
+# Left hand: 91..111, Right hand: 112..132
+# Wrist=0, fingertips = 4(thumb), 8(index), 12(middle), 16(ring), 20(pinky)
+LHAND_BASE = 91
+RHAND_BASE = 112
+FINGERTIP_OFFSETS = [4, 8, 12, 16, 20]  # relative to hand base
+
+
+def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
+                min_score: float = 0.25) -> float | None:
+    """Measure avg distance from hand wrist to fingertips (proxy for depth)."""
+    wrist = kpts[hand_base]
+    ws = scores[hand_base]
+    if ws < min_score:
+        return None
+    dists = []
+    for off in FINGERTIP_OFFSETS:
+        idx = hand_base + off
+        if scores[idx] >= min_score:
+            dists.append(np.linalg.norm(kpts[idx] - wrist))
+    if len(dists) < 3:
+        return None
+    return float(np.mean(dists))
 
 
 class WristTracker:
-    """Per-person-slot wrist position history."""
+    """Per-person-slot wrist position + hand scale history."""
 
     def __init__(self, max_history: int = 15):
         self.max_history = max_history
-        self._hist: list[deque] = []
+        self._pos_hist: list[deque] = []   # (x, y) wrist positions
+        self._scale_hist: list[deque] = [] # hand scale (finger spread)
 
     def resize(self, n: int):
-        while len(self._hist) < n:
-            self._hist.append(deque(maxlen=self.max_history))
-        self._hist = self._hist[:n]
+        while len(self._pos_hist) < n:
+            self._pos_hist.append(deque(maxlen=self.max_history))
+            self._scale_hist.append(deque(maxlen=self.max_history))
+        self._pos_hist = self._pos_hist[:n]
+        self._scale_hist = self._scale_hist[:n]
 
-    def update(self, idx: int, xy: tuple[float, float] | None):
-        if 0 <= idx < len(self._hist) and xy is not None:
-            self._hist[idx].append(xy)
+    def update(self, idx: int, xy: tuple[float, float] | None,
+              scale: float | None):
+        if 0 <= idx < len(self._pos_hist):
+            if xy is not None:
+                self._pos_hist[idx].append(xy)
+            if scale is not None:
+                self._scale_hist[idx].append(scale)
 
-    def get(self, idx: int) -> list[tuple[float, float]]:
-        if 0 <= idx < len(self._hist):
-            return list(self._hist[idx])
+    def get_pos(self, idx: int) -> list[tuple[float, float]]:
+        if 0 <= idx < len(self._pos_hist):
+            return list(self._pos_hist[idx])
+        return []
+
+    def get_scale(self, idx: int) -> list[float]:
+        if 0 <= idx < len(self._scale_hist):
+            return list(self._scale_hist[idx])
         return []
 
     def clear_all(self):
-        self._hist.clear()
+        self._pos_hist.clear()
+        self._scale_hist.clear()
 
 
 def _dominant_wrist(
     kpts: np.ndarray, scores: np.ndarray, min_score: float = 0.3,
-) -> tuple[float, float] | None:
-    """Return (x, y) of the raised (higher) wrist, or None."""
+) -> tuple[tuple[float, float] | None, int | None]:
+    """Return ((x, y), hand_base) of the raised (higher) wrist, or (None, None)."""
     lw_ok = scores[KP_LWRIST] >= min_score
     rw_ok = scores[KP_RWRIST] >= min_score
     if lw_ok and rw_ok:
-        idx = KP_LWRIST if kpts[KP_LWRIST, 1] < kpts[KP_RWRIST, 1] else KP_RWRIST
+        if kpts[KP_LWRIST, 1] < kpts[KP_RWRIST, 1]:  # lower y = higher
+            idx, hbase = KP_LWRIST, LHAND_BASE
+        else:
+            idx, hbase = KP_RWRIST, RHAND_BASE
     elif lw_ok:
-        idx = KP_LWRIST
+        idx, hbase = KP_LWRIST, LHAND_BASE
     elif rw_ok:
-        idx = KP_RWRIST
+        idx, hbase = KP_RWRIST, RHAND_BASE
     else:
-        return None
-    return (float(kpts[idx, 0]), float(kpts[idx, 1]))
+        return None, None
+    return (float(kpts[idx, 0]), float(kpts[idx, 1])), hbase
 
 
 def classify_hand_gesture(
-    wrist_history: list[tuple[float, float]], bbox_h: float,
+    wrist_history: list[tuple[float, float]],
+    scale_history: list[float],
+    bbox_h: float,
 ) -> int | None:
     """
-    Classify stop / wave / come from wrist trajectory.
+    Classify stop / wave / come from wrist trajectory + hand scale change.
 
-    stop  -> hand nearly still (low avg speed)
-    wave  -> lateral oscillation (>=2 x-direction reversals + wide x range)
-    come  -> moderate movement, not lateral oscillation (beckoning)
+    Hand scale (avg fingertip-to-wrist distance) acts as a depth proxy:
+      - scale increasing  → hand moving TOWARD camera  → stop
+      - scale decreasing  → hand moving AWAY from camera → come
+      - lateral oscillation (x-dir reversals)            → wave
     """
     MIN_FRAMES = 6
     if len(wrist_history) < MIN_FRAMES:
@@ -281,18 +323,42 @@ def classify_hand_gesture(
     speeds = np.linalg.norm(diffs, axis=1) / norm
     avg_speed = float(np.mean(speeds))
 
-    # x-direction reversals -> oscillation count
+    # x-direction reversals → oscillation count
     dx = diffs[:, 0]
     signs = np.sign(dx)
     nonzero = signs[signs != 0]
     x_dir_changes = int(np.sum(np.abs(np.diff(nonzero)) > 0)) if len(nonzero) > 1 else 0
-
     x_range = float(np.ptp(pts[:, 0])) / norm
 
-    if avg_speed < 0.015:
-        return STOP_IDX
+    # wave: lateral oscillation
     if x_dir_changes >= 2 and x_range > 0.04:
         return WAVE_IDX
+
+    # Use hand scale (finger spread) to detect depth direction
+    if len(scale_history) >= MIN_FRAMES:
+        scales = np.array(scale_history[-15:])
+        # Linear trend of scale over recent frames
+        t = np.arange(len(scales), dtype=np.float32)
+        # Normalised slope: positive = growing (toward camera), negative = shrinking (away)
+        if len(scales) >= 3:
+            slope = float(np.polyfit(t, scales, 1)[0])
+            mean_scale = float(np.mean(scales))
+            # Normalise slope by mean scale to get relative rate
+            rel_slope = slope / max(mean_scale, 1.0)
+
+            # come: hand moving away from camera → scale shrinking or roughly stable
+            #       rel_slope < threshold (can be slightly negative or near zero with motion)
+            # stop: hand moving toward camera → scale growing, or hand held still
+            if avg_speed < 0.012:
+                return STOP_IDX  # hand truly still → stop
+            if rel_slope > 0.01:
+                return STOP_IDX  # hand growing → moving toward camera
+            else:
+                return COME_IDX  # hand shrinking or stable + movement → beckoning
+
+    # Fallback: low motion = stop, any motion = come
+    if avg_speed < 0.015:
+        return STOP_IDX
     return COME_IDX
 
 
@@ -440,7 +506,9 @@ def main() -> None:
                 inp, warp = rtmw.preprocess(frame, (x1, y1, x2, y2), args.bbox_pad)
                 outs = rtmw_sess.run(rtmw_outs, {rtmw_in: inp})
                 kpts, kscores = rtmw.postprocess(outs, warp)
-                wrist_tracker.update(bi, _dominant_wrist(kpts, kscores))
+                wrist_xy, hbase = _dominant_wrist(kpts, kscores)
+                scale = _hand_scale(kpts, kscores, hbase) if hbase is not None else None
+                wrist_tracker.update(bi, wrist_xy, scale)
             except Exception:
                 pass
 
@@ -482,7 +550,9 @@ def main() -> None:
                         if cls is not None and cls in HAND_GESTURE_SET:
                             bh = boxes[bi_idx][3] - boxes[bi_idx][1]
                             gesture = classify_hand_gesture(
-                                wrist_tracker.get(bi_idx), bh,
+                                wrist_tracker.get_pos(bi_idx),
+                                wrist_tracker.get_scale(bi_idx),
+                                bh,
                             )
                             if gesture is not None:
                                 raw_classes[bi_idx] = gesture
