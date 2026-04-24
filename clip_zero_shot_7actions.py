@@ -622,6 +622,19 @@ def main() -> None:
                         raw_classes[bi] = int(pred)
                         raw_confs[bi] = float(conf)
 
+                    # ── low-confidence gate: fall back to idle ──
+                    LOW_CONF_THRESHOLD = 0.60
+                    LOW_CONF_ACTIONS = {STOP_IDX, COME_IDX,
+                                        LABELS.index("play phone"),
+                                        LABELS.index("take a picture"),
+                                        LABELS.index("love"),
+                                        LABELS.index("phone call")}
+                    for bi_idx in range(len(raw_classes)):
+                        cls = raw_classes[bi_idx]
+                        if cls is not None and cls in LOW_CONF_ACTIONS:
+                            if raw_confs[bi_idx] < LOW_CONF_THRESHOLD:
+                                raw_classes[bi_idx] = IDLE_IDX
+
                     # ── refine stop / wave / come via wrist motion ──
                     now = time.time()
                     for bi_idx in range(len(raw_classes)):
