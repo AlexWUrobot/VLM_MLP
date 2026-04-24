@@ -361,14 +361,8 @@ def classify_hand_gesture(
     """
     Classify stop / wave / come from wrist trajectory + palm orientation.
 
-    Primary signal — palm orientation (from RTMW hand keypoints):
-      - palm facing camera  → stop  or  wave
-      - palm facing away    → come  (beckoning gesture, back of hand visible)
-
-    Secondary signals:
-      - lateral oscillation (x-dir reversals) + palm facing → wave
-      - palm facing camera + still or forward push          → stop
-      - hand scale shrinking (moving away)                  → come
+    come requires: palm facing away AND hand scale shrinking (moving away
+    from camera).  Pure palm-away with no motion → stop (hand just resting).
     """
     MIN_FRAMES = 5
     if len(wrist_history) < MIN_FRAMES:
@@ -397,11 +391,28 @@ def classify_hand_gesture(
         n_facing = sum(recent)
         palm_facing = n_facing > len(recent) * 0.5
 
+    # ── Scale trend (depth proxy) ──
+    scale_shrinking = False
+    if len(scale_history) >= MIN_FRAMES:
+        scales = np.array(scale_history[-15:])
+        if len(scales) >= 3:
+            t = np.arange(len(scales), dtype=np.float32)
+            slope = float(np.polyfit(t, scales, 1)[0])
+            mean_scale = float(np.mean(scales))
+            rel_slope = slope / max(mean_scale, 1.0)
+            scale_shrinking = rel_slope < -0.002  # hand getting smaller → away
+
     # ── Decision tree ──
     if palm_facing is not None:
         if not palm_facing:
-            # Back of hand visible → COME (beckoning)
-            return COME_IDX
+            # Back of hand visible → COME if scale shrinking (even slowly)
+            if scale_shrinking:
+                return COME_IDX
+            # Palm away but hand still → stop
+            if avg_speed < 0.015:
+                return STOP_IDX
+            # Palm away + some motion but not clearly shrinking → stop
+            return STOP_IDX
         else:
             # Palm facing camera → WAVE or STOP
             if is_oscillating:
@@ -413,18 +424,11 @@ def classify_hand_gesture(
         return WAVE_IDX
 
     if len(scale_history) >= MIN_FRAMES:
-        scales = np.array(scale_history[-15:])
-        if len(scales) >= 3:
-            t = np.arange(len(scales), dtype=np.float32)
-            slope = float(np.polyfit(t, scales, 1)[0])
-            mean_scale = float(np.mean(scales))
-            rel_slope = slope / max(mean_scale, 1.0)
-            if avg_speed < 0.012:
-                return STOP_IDX
-            if rel_slope > 0.01:
-                return STOP_IDX
-            else:
-                return COME_IDX
+        if avg_speed < 0.012:
+            return STOP_IDX
+        if scale_shrinking:
+            return COME_IDX
+        return STOP_IDX
 
     if avg_speed < 0.015:
         return STOP_IDX
@@ -530,6 +534,8 @@ def main() -> None:
     rtmw_in = rtmw_sess.get_inputs()[0].name
     rtmw_outs = [o.name for o in rtmw_sess.get_outputs()]
     wrist_tracker = WristTracker(max_history=15)
+    come_hold_until: list[float] = []  # per-person timestamp until which "come" is held
+    COME_HOLD_SEC = 0.5
     print("[INFO] RTMW loaded for hand-gesture refinement")
 
     # ── open camera ──────────────────────────────────────────────────
@@ -567,6 +573,7 @@ def main() -> None:
         stable_confs = _resize_list(stable_confs, len(boxes), 0.0)
         pending_classes = _resize_list(pending_classes, len(boxes), None)
         pending_counts = _resize_list(pending_counts, len(boxes), 0)
+        come_hold_until = _resize_list(come_hold_until, len(boxes), 0.0)
 
         # ── RTMW wrist tracking (every frame for smooth motion) ─────
         wrist_tracker.resize(len(boxes))
@@ -615,6 +622,7 @@ def main() -> None:
                         raw_confs[bi] = float(conf)
 
                     # ── refine stop / wave / come via wrist motion ──
+                    now = time.time()
                     for bi_idx in range(len(raw_classes)):
                         cls = raw_classes[bi_idx]
                         if cls is not None and cls in HAND_GESTURE_SET:
@@ -626,7 +634,14 @@ def main() -> None:
                                 bh,
                             )
                             if gesture is not None:
-                                raw_classes[bi_idx] = gesture
+                                if gesture == COME_IDX:
+                                    come_hold_until[bi_idx] = now + COME_HOLD_SEC
+                                    raw_classes[bi_idx] = COME_IDX
+                                elif now < come_hold_until[bi_idx]:
+                                    # Hold come for 0.5s after last trigger
+                                    raw_classes[bi_idx] = COME_IDX
+                                else:
+                                    raw_classes[bi_idx] = gesture
 
                 stable_classes, pending_classes, pending_counts = _apply_inertia(
                     raw_classes, stable_classes, pending_classes, pending_counts, args.inertia,
@@ -638,6 +653,7 @@ def main() -> None:
                 stable_classes, stable_confs = [], []
                 pending_classes, pending_counts = [], []
                 wrist_tracker.clear_all()
+                come_hold_until = []
 
         # ── draw ─────────────────────────────────────────────────────
         for i, (x1, y1, x2, y2) in enumerate(boxes):
