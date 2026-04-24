@@ -41,6 +41,7 @@ LABELS = [
     "love",
     "high_wave",
     "small_love",
+    "middle_finger",
 ]
 
 # Multiple prompts per class to improve zero-shot accuracy
@@ -96,6 +97,16 @@ TEXT_PROMPTS: dict[str, list[str]] = {
         "a person crossing thumb tip and index fingertip to form a tiny heart",
         "a person holding up a Korean finger heart sign",
     ],
+    "middle_finger": [
+        "a person showing their middle finger",
+        "a person giving the finger gesture",
+        "a person flipping the bird with hand raised",
+    ],
+}
+
+# Display names override: internal label → on-screen text
+DISPLAY_NAMES: dict[str, str] = {
+    "middle_finger": "Jerin, I know you XD",
 }
 
 
@@ -215,6 +226,7 @@ LABEL_COLORS: dict[str, tuple[int, int, int]] = {
     "love":           (255, 0, 255),  # magenta
     "high_wave":      (0, 255, 255),  # yellow
     "small_love":     (255, 105, 180),# pink
+    "middle_finger":     (0, 0, 255),  # red
 }
 
 MIN_DISPLAY_CONF = 0.15  # show label only above this similarity
@@ -300,6 +312,7 @@ STOP_IDX = LABELS.index("stop")      # 2
 IDLE_IDX = LABELS.index("idle")      # 6
 HIGH_WAVE_IDX = LABELS.index("high_wave")  # 8
 SMALL_LOVE_IDX = LABELS.index("small_love")  # 9
+MIDFINGER_IDX = LABELS.index("middle_finger")  # 10
 HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX, HIGH_WAVE_IDX}
 
 # RTMW body keypoint for head reference (nose)
@@ -317,6 +330,7 @@ FINGERTIP_OFFSETS = [4, 8, 12, 16, 20]  # relative to hand base
 INDEX_MCP_OFF = 5
 PINKY_MCP_OFF = 17
 MIDDLE_MCP_OFF = 9
+RING_MCP_OFF = 13
 THUMB_TIP_OFF = 4
 
 # Additional hand keypoint offsets for finger-heart (small_love) detection
@@ -331,6 +345,7 @@ INDEX_PIP_OFF = 6
 MIDDLE_PIP_OFF = 10
 RING_PIP_OFF = 14
 PINKY_PIP_OFF = 18
+THUMB_IP_OFF = 2  # thumb interphalangeal joint (PIP equivalent)
 
 
 def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
@@ -424,12 +439,18 @@ def _detect_finger_heart(
     if hand_sc < min_hand_scale_px:
         return False
     tip_dist = float(np.linalg.norm(kpts[thumb_tip] - kpts[idx_tip]))
-    if tip_dist / hand_sc > 0.55:  # tips must be close relative to hand size
+    if tip_dist / hand_sc > 0.38:  # tips must be very close relative to hand size
         return False
 
     # 2. Index tip should be at or above thumb tip (lower y = higher in image)
-    #    Allow a small tolerance downward (20% of hand scale)
-    if kpts[idx_tip, 1] > kpts[thumb_tip, 1] + hand_sc * 0.2:
+    #    Allow a small tolerance downward (10% of hand scale)
+    if kpts[idx_tip, 1] > kpts[thumb_tip, 1] + hand_sc * 0.10:
+        return False
+
+    # 2b. Thumb and index tips must both be above (lower y) the wrist —
+    #     a finger-heart is held up, not down.
+    wrist_y = float(kpts[wrist, 1])
+    if float(kpts[thumb_tip, 1]) > wrist_y or float(kpts[idx_tip, 1]) > wrist_y:
         return False
 
     # 3. Other fingers curled: tip closer to wrist than PIP is
@@ -439,9 +460,159 @@ def _detect_finger_heart(
             continue
         tip_to_wrist = float(np.linalg.norm(kpts[ftip] - kpts[wrist]))
         pip_to_wrist = float(np.linalg.norm(kpts[fpip] - kpts[wrist]))
-        if tip_to_wrist < pip_to_wrist * 1.15:
+        if tip_to_wrist < pip_to_wrist * 1.05:
             curled_count += 1
-    if curled_count < 2:  # at least 2 of 3 fingers must be curled
+    if curled_count < 3:  # all 3 remaining fingers must be curled
+        return False
+
+    return True
+
+
+def _hand_bbox(
+    kpts: np.ndarray, scores: np.ndarray, hand_base: int,
+    img_h: int, img_w: int, min_score: float = 0.25, pad: float = 0.4,
+) -> tuple[int, int, int, int] | None:
+    """Return (x1, y1, x2, y2) bounding box around visible hand keypoints, or None."""
+    xs, ys = [], []
+    for off in range(21):
+        idx = hand_base + off
+        if scores[idx] >= min_score:
+            xs.append(float(kpts[idx, 0]))
+            ys.append(float(kpts[idx, 1]))
+    if len(xs) < 4:
+        return None
+    cx = (min(xs) + max(xs)) / 2
+    cy = (min(ys) + max(ys)) / 2
+    half_w = (max(xs) - min(xs)) / 2 * (1 + pad)
+    half_h = (max(ys) - min(ys)) / 2 * (1 + pad)
+    side = max(half_w, half_h)  # square crop
+    x1 = max(0, int(cx - side))
+    y1 = max(0, int(cy - side))
+    x2 = min(img_w, int(cx + side))
+    y2 = min(img_h, int(cy + side))
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _detect_middle_finger(
+    kpts: np.ndarray, scores: np.ndarray, hand_base: int,
+    min_score: float = 0.25,
+) -> bool:
+    """
+    Detect the middle-finger gesture using 2D hand keypoints.
+
+    Uses spatial position verification: the extended fingertip must be
+    physically located at the centre of the hand (between index MCP and
+    pinky MCP), not at the edges.  MCP joints on the palm are reliably
+    detected and don't get swapped, so this catches cases where RTMW
+    mislabels which finger is extended.
+    """
+    wrist = hand_base
+    mid_tip = hand_base + MIDDLE_TIP_OFF
+    mid_pip = hand_base + MIDDLE_PIP_OFF
+    mid_mcp = hand_base + MIDDLE_MCP_OFF
+    idx_tip = hand_base + INDEX_TIP_OFF
+    idx_pip = hand_base + INDEX_PIP_OFF
+    idx_mcp = hand_base + INDEX_MCP_OFF
+    ring_tip = hand_base + RING_TIP_OFF
+    ring_pip = hand_base + RING_PIP_OFF
+    ring_mcp = hand_base + RING_MCP_OFF
+    pink_tip = hand_base + PINKY_TIP_OFF
+    pink_pip = hand_base + PINKY_PIP_OFF
+    pink_mcp = hand_base + PINKY_MCP_OFF
+    thumb_tip = hand_base + THUMB_TIP_OFF
+    thumb_ip = hand_base + THUMB_IP_OFF
+
+    # Need middle finger tip, MCP, wrist, and palm MCPs for spatial check
+    essential = [wrist, mid_tip, mid_mcp, idx_mcp, pink_mcp]
+    if any(scores[i] < min_score for i in essential):
+        return False
+
+    hand_sc = _hand_scale(kpts, scores, hand_base, min_score)
+    if hand_sc is None or hand_sc < 1.0:
+        return False
+
+    # 1. Middle finger must be extended: tip is far from wrist and above MCP
+    mid_tip_to_wrist = float(np.linalg.norm(kpts[mid_tip] - kpts[wrist]))
+    mid_mcp_to_wrist = float(np.linalg.norm(kpts[mid_mcp] - kpts[wrist]))
+    if mid_tip_to_wrist < mid_mcp_to_wrist * 1.4:
+        return False  # middle finger not extended enough
+    # Middle tip should be above (lower y) its MCP
+    if kpts[mid_tip, 1] > kpts[mid_mcp, 1]:
+        return False
+
+    # ── SPATIAL POSITION CHECK ──────────────────────────────────────
+    # Project the extended fingertip onto the palm axis (index_MCP → pinky_MCP)
+    # to verify it's physically at the middle-finger position, not at the
+    # index/thumb/pinky edge.  This is robust to RTMW keypoint swaps.
+    palm_vec = kpts[pink_mcp] - kpts[idx_mcp]  # vector across the palm
+    palm_len_sq = float(np.dot(palm_vec, palm_vec))
+    if palm_len_sq < 1.0:
+        return False  # degenerate palm detection
+    # Where does the middle fingertip project onto this axis?  (0 = index side, 1 = pinky side)
+    tip_frac = float(np.dot(kpts[mid_tip] - kpts[idx_mcp], palm_vec)) / palm_len_sq
+    # Where does the true middle MCP project?  (should be ~0.3-0.5)
+    mcp_frac = float(np.dot(kpts[mid_mcp] - kpts[idx_mcp], palm_vec)) / palm_len_sq
+    # The tip must be near the middle MCP position (within ±0.25)
+    if abs(tip_frac - mcp_frac) > 0.25:
+        return False  # tip is physically at wrong finger position
+    # Reject if tip projects outside the plausible middle-finger zone [0.15, 0.65]
+    if tip_frac < 0.15 or tip_frac > 0.65:
+        return False  # too far to index side or pinky side
+
+    # 1b. Thumb must NOT be extended (rejects thumbs-up at any angle).
+    if scores[thumb_tip] >= min_score:
+        thumb_dist = float(np.linalg.norm(kpts[thumb_tip] - kpts[wrist]))
+        if thumb_dist > hand_sc * 0.80:
+            return False  # thumb looks extended → likely thumbs-up
+
+    # 1c. Middle fingertip must be the HIGHEST point (lowest y) among all
+    #     visible fingertips.
+    mid_y = float(kpts[mid_tip, 1])
+    for otip in [idx_tip, ring_tip, pink_tip, thumb_tip]:
+        if scores[otip] < min_score:
+            continue
+        if float(kpts[otip, 1]) < mid_y - 3.0:  # 3px tolerance
+            return False  # another fingertip is higher → not middle finger
+
+    # 2. Adjacent fingers (index & ring) MUST be visible and clearly shorter.
+    for adj_tip in [idx_tip, ring_tip]:
+        if scores[adj_tip] < min_score:
+            return False  # can't verify adjacent finger is curled → reject
+        adj_dist = float(np.linalg.norm(kpts[adj_tip] - kpts[wrist]))
+        if adj_dist >= mid_tip_to_wrist * 0.70:
+            return False  # adjacent finger too extended
+
+    # 3. ALL other fingertips: verify at least 3 are visibly shorter.
+    other_tips = [idx_tip, ring_tip, pink_tip, thumb_tip]
+    verified_shorter = 0
+    for otip in other_tips:
+        if scores[otip] < min_score:
+            continue
+        other_dist = float(np.linalg.norm(kpts[otip] - kpts[wrist]))
+        if other_dist >= mid_tip_to_wrist * 0.80:
+            return False  # another finger is similarly or more extended
+        verified_shorter += 1
+    if verified_shorter < 3:
+        return False  # can't confirm enough fingers are shorter
+
+    # 4. Other fingers must be curled (tip closer to wrist than their PIP)
+    curled = 0
+    checks = [
+        (idx_tip, idx_pip),
+        (ring_tip, ring_pip),
+        (pink_tip, pink_pip),
+        (thumb_tip, thumb_ip),
+    ]
+    for ftip, fpip in checks:
+        if scores[ftip] < min_score or scores[fpip] < min_score:
+            continue
+        tip_dist = float(np.linalg.norm(kpts[ftip] - kpts[wrist]))
+        pip_dist = float(np.linalg.norm(kpts[fpip] - kpts[wrist]))
+        if tip_dist < pip_dist * 1.2:
+            curled += 1
+    if curled < 3:  # at least 3 of 4 non-middle fingers must be curled
         return False
 
     return True
@@ -709,6 +880,9 @@ def main() -> None:
     small_love_per_person: list[bool] = []  # per-person: finger-heart detected this frame
     small_love_hold_until: list[float] = []  # per-person timestamp until which "small_love" is held
     SMALL_LOVE_HOLD_SEC = 0.4
+    midfinger_per_person: list[bool] = []   # per-person: middle finger detected this frame
+    midfinger_hold_until: list[float] = []  # per-person timestamp until which "middle_finger" is held
+    MIDFINGER_HOLD_SEC = 0.5
     # Per-person heart animation state
     anim_type: list[str | None] = []    # None / "love" / "small_love"
     anim_start: list[float] = []        # timestamp when animation started
@@ -757,6 +931,8 @@ def main() -> None:
         head_y_per_person = _resize_list(head_y_per_person, len(boxes), None)
         small_love_per_person = _resize_list(small_love_per_person, len(boxes), False)
         small_love_hold_until = _resize_list(small_love_hold_until, len(boxes), 0.0)
+        midfinger_per_person = _resize_list(midfinger_per_person, len(boxes), False)
+        midfinger_hold_until = _resize_list(midfinger_hold_until, len(boxes), 0.0)
         anim_type = _resize_list(anim_type, len(boxes), None)
         anim_start = _resize_list(anim_start, len(boxes), 0.0)
 
@@ -794,6 +970,32 @@ def main() -> None:
                     else:
                         fh_detected = False  # not enough history yet
                 small_love_per_person[bi] = fh_detected
+                # Check both hands for middle finger (Jerin)
+                # Step 1: RTMW pose check
+                mf_hand_base = None
+                if _detect_middle_finger(kpts, kscores, LHAND_BASE):
+                    mf_hand_base = LHAND_BASE
+                elif _detect_middle_finger(kpts, kscores, RHAND_BASE):
+                    mf_hand_base = RHAND_BASE
+                # Step 2: CLIP visual double-check on hand crop
+                mf_confirmed = False
+                if mf_hand_base is not None:
+                    h_fr, w_fr = frame.shape[:2]
+                    hbox = _hand_bbox(kpts, kscores, mf_hand_base, h_fr, w_fr)
+                    if hbox is not None:
+                        hx1, hy1, hx2, hy2 = hbox
+                        hand_crop = cv2.cvtColor(frame[hy1:hy2, hx1:hx2], cv2.COLOR_BGR2RGB)
+                        if hand_crop.size > 0:
+                            hand_pil = Image.fromarray(hand_crop)
+                            hand_t = preprocess(hand_pil).unsqueeze(0).to(device)
+                            hand_feat = clip_model.encode_image(hand_t).float()
+                            hand_feat = F.normalize(hand_feat, dim=-1)
+                            hand_sims = (hand_feat @ text_feats.T).squeeze(0)
+                            hand_probs = torch.softmax(hand_sims * 100.0, dim=0)
+                            midfinger_conf = float(hand_probs[MIDFINGER_IDX])
+                            if midfinger_conf > 0.60:
+                                mf_confirmed = True
+                midfinger_per_person[bi] = mf_confirmed
             except Exception:
                 pass
 
@@ -846,6 +1048,9 @@ def main() -> None:
                     now = time.time()
                     for bi_idx in range(len(raw_classes)):
                         # ── 1. Hold check (unconditional – overrides CLIP) ──
+                        if now < midfinger_hold_until[bi_idx]:
+                            raw_classes[bi_idx] = MIDFINGER_IDX
+                            continue
                         if now < small_love_hold_until[bi_idx]:
                             raw_classes[bi_idx] = SMALL_LOVE_IDX
                             continue
@@ -860,6 +1065,10 @@ def main() -> None:
                             continue
 
                         # ── 1b. Finger-heart override (pose-based, any CLIP class) ──
+                        if midfinger_per_person[bi_idx]:
+                            midfinger_hold_until[bi_idx] = now + MIDFINGER_HOLD_SEC
+                            raw_classes[bi_idx] = MIDFINGER_IDX
+                            continue
                         if small_love_per_person[bi_idx]:
                             small_love_hold_until[bi_idx] = now + SMALL_LOVE_HOLD_SEC
                             raw_classes[bi_idx] = SMALL_LOVE_IDX
@@ -939,6 +1148,8 @@ def main() -> None:
                 head_y_per_person = []
                 small_love_per_person = []
                 small_love_hold_until = []
+                midfinger_per_person = []
+                midfinger_hold_until = []
                 anim_type = []
                 anim_start = []
 
@@ -956,8 +1167,9 @@ def main() -> None:
                 text = f"{conf * 100:.0f}%"
             else:
                 label_name = LABELS[int(cls)]
+                display_name = DISPLAY_NAMES.get(label_name, label_name)
                 color = LABEL_COLORS.get(label_name, (0, 255, 0))
-                text = f"{int(cls) + 1} {label_name} {conf * 100:.0f}%"
+                text = f"{int(cls) + 1} {display_name} {conf * 100:.0f}%"
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             if text:
