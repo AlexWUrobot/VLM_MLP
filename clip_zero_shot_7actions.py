@@ -191,7 +191,7 @@ def get_person_boxes(frame_bgr, yolo_model, yolo_conf: float) -> list[tuple[int,
     if getattr(r, "boxes", None) is None or len(r.boxes) == 0:
         return []
     h, w = frame_bgr.shape[:2]
-    min_area = h * w * 0.01  # at least 1% of frame area
+    min_area = h * w * 0.05  # at least 5% of frame area (ignore distant people)
     boxes, areas = [], []
     for box in r.boxes:
         if box.xyxy is None or len(box.xyxy) == 0:
@@ -251,15 +251,24 @@ def _smooth_boxes(
                 pairs.append((iou, pi, ri))
     pairs.sort(key=lambda x: x[0], reverse=True)
 
-    out_boxes: list[tuple[int,int,int,int]] = []
-    out_smooth: list[tuple[float,float,float,float]] = []
-    out_miss: list[int] = []
-
+    # Greedy IoU matching: best pairs first
+    matched_pairs: list[tuple[int, int]] = []  # (pi, ri)
     for _, pi, ri in pairs:
         if matched_prev[pi] or matched_raw[ri]:
             continue
         matched_prev[pi] = True
         matched_raw[ri] = True
+        matched_pairs.append((pi, ri))
+
+    # Output matched pairs in prev-index order so per-person state arrays
+    # (stable_classes, hand_visible, etc.) stay aligned with the right person.
+    matched_pairs.sort(key=lambda x: x[0])
+
+    out_boxes: list[tuple[int,int,int,int]] = []
+    out_smooth: list[tuple[float,float,float,float]] = []
+    out_miss: list[int] = []
+
+    for pi, ri in matched_pairs:
         # EMA blend
         sx = prev_smooth[pi][0] * (1 - alpha) + raw_boxes[ri][0] * alpha
         sy = prev_smooth[pi][1] * (1 - alpha) + raw_boxes[ri][1] * alpha
@@ -835,7 +844,9 @@ def classify_hand_gesture(
             return STOP_IDX
 
     # ── Fallback when palm orientation unavailable: use scale + motion ──
-    if is_oscillating:
+    # Only classify if we have hand scale data; otherwise we're just
+    # seeing body wrist movement without actual hand keypoints.
+    if is_oscillating and len(scale_history) >= MIN_FRAMES:
         return WAVE_IDX
 
     if len(scale_history) >= MIN_FRAMES:
@@ -845,9 +856,8 @@ def classify_hand_gesture(
             return COME_IDX
         return STOP_IDX
 
-    if avg_speed < 0.015:
-        return STOP_IDX
-    return COME_IDX
+    # No hand scale data → can't reliably classify
+    return None
 
 
 @torch.inference_mode()
@@ -968,6 +978,7 @@ def main() -> None:
     midfinger_per_person: list[bool] = []   # per-person: middle finger detected this frame
     midfinger_hold_until: list[float] = []  # per-person timestamp until which "middle_finger" is held
     MIDFINGER_HOLD_SEC = 0.5
+    hand_visible: list[bool] = []  # per-person: are hand keypoints visible THIS frame?
     # Per-person heart animation state
     anim_type: list[str | None] = []    # None / "love" / "small_love"
     anim_start: list[float] = []        # timestamp when animation started
@@ -1027,6 +1038,7 @@ def main() -> None:
         small_love_hold_until = _resize_list(small_love_hold_until, len(boxes), 0.0)
         midfinger_per_person = _resize_list(midfinger_per_person, len(boxes), False)
         midfinger_hold_until = _resize_list(midfinger_hold_until, len(boxes), 0.0)
+        hand_visible = _resize_list(hand_visible, len(boxes), False)
         anim_type = _resize_list(anim_type, len(boxes), None)
         anim_start = _resize_list(anim_start, len(boxes), 0.0)
 
@@ -1040,6 +1052,7 @@ def main() -> None:
                 wrist_xy, hbase = _dominant_wrist(kpts, kscores)
                 scale = _hand_scale(kpts, kscores, hbase) if hbase is not None else None
                 palm = _palm_facing_camera(kpts, kscores, hbase) if hbase is not None else None
+                hand_visible[bi] = scale is not None  # hand keypoints visible this frame
                 wrist_tracker.update(bi, wrist_xy, scale, palm)
                 # Track head (nose) y-coordinate for high_wave detection
                 if kscores[KP_NOSE] >= 0.3:
@@ -1164,6 +1177,11 @@ def main() -> None:
                         # ── 2. Gesture refinement (only for hand-gesture classes) ──
                         cls = raw_classes[bi_idx]
                         if cls is not None and cls in HAND_GESTURE_SET:
+                            # Only accept hand-gesture classes if hand keypoints
+                            # are actually visible in the current frame
+                            if not hand_visible[bi_idx]:
+                                raw_classes[bi_idx] = IDLE_IDX
+                                continue
                             bh = boxes[bi_idx][3] - boxes[bi_idx][1]
                             gesture = classify_hand_gesture(
                                 wrist_tracker.get_pos(bi_idx),
@@ -1239,6 +1257,7 @@ def main() -> None:
                 small_love_hold_until = []
                 midfinger_per_person = []
                 midfinger_hold_until = []
+                hand_visible = []
                 anim_type = []
                 anim_start = []
 
