@@ -21,6 +21,8 @@ Train/
 *.jpg
 *.jpeg
 *.png
+!Model_1.png
+!Model_2.png
 *.mp4
 *.mov
 *.mkv
