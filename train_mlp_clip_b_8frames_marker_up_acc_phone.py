@@ -455,7 +455,7 @@ COCO_PHONE_CLASS = 67  # cell phone in COCO
 def compute_phone_detected_features(
     paths: list[str],
     yolo_model_path: str,
-    conf: float = 0.25,
+    conf: float = 0.15,
 ) -> np.ndarray:
     """Run YOLO phone detection on each training image (person crop).
 

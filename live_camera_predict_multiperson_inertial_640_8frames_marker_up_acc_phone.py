@@ -518,6 +518,12 @@ def parse_args() -> argparse.Namespace:
              "Enables ONNX Runtime with TensorRT FP16 > CUDA > CPU for CLIP encoding.",
     )
     p.add_argument("--window", default="Live Prediction", help="OpenCV window name")
+    p.add_argument(
+        "--min-conf",
+        type=float,
+        default=0.45,
+        help="Minimum confidence to display an action label. Below this, show 'idle' in grey (default: 0.45).",
+    )
     return p.parse_args()
 
 
@@ -744,7 +750,7 @@ def detect_phones_in_hand_crops(
     frame_bgr,
     hand_bboxes_per_person: list[list[tuple[int, int, int, int]]],
     yolo_model,
-    conf: float = 0.1,
+    conf: float = 0.15,
 ) -> list[bool]:
     """Run YOLO phone detection on hand-region crops.
 
@@ -976,7 +982,10 @@ def main() -> None:
     # Resolve label indices for phone gating
     phone_label_idx = labels.index("phone") if "phone" in labels else -1
     play_phone_label_idx = labels.index("play_phone") if "play_phone" in labels else -1
+    idle_label_idx = labels.index("idle") if "idle" in labels else -1
+    min_conf = max(0.0, min(1.0, float(args.min_conf)))
     print(f"[phone gate] factor={phone_gate:.2f} sticky={phone_sticky_sec:.2f}s phone_idx={phone_label_idx} play_phone_idx={play_phone_label_idx}")
+    print(f"[min conf] {min_conf:.2f} (below this -> idle)")
 
     frame_i = 0
     t0 = time.time()
@@ -1240,11 +1249,13 @@ def main() -> None:
                     color = (0, 255, 0)
                 else:
                     label_name = str(labels[int(cls)])
-                    if conf < MIN_DISPLAY_CONF:
-                        color = (160, 160, 160)
+                    # Fall back to idle when confidence is too low
+                    if conf < min_conf and idle_label_idx >= 0 and int(cls) != idle_label_idx:
+                        label_name = "idle"
+                        color = (160, 160, 160)  # grey
                     else:
                         color = _color_for_label_name(label_name)
-                    text = f"{int(cls) + 1} {label_name} {conf * 100.0:.0f}%"
+                    text = f"{label_name} {conf * 100.0:.0f}%"
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 if text:

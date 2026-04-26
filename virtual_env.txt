@@ -257,5 +257,19 @@ python3 live_camera_predict_multiperson_inertial_640_8frames_marker_acc.py   --c
 
 -------------------------------- Yolo  assist phone detect -----------
 
+python3  train_mlp_clip_b_8frames_marker_up_acc_phone.py   --temporal-model gru --num-frames 8 --feat-agg concat   --epochs 50   --out fusion_gru_8frames_marker_phone.pt
 
-$ python3  train_mlp_clip_b_8frames_marker_up_acc_phone.py   --temporal-model gru --num-frames 8 --feat-agg concat   --epochs 50   --out fusion_gru_8frames_marker_phone.pt
+
+
+
+-------------------------------- Phone Gate 
+
+detect_phones_in_hand_crops  = 0.15
+compute_phone_detected_features = 0.15
+
+
+
+python3 live_camera_predict_multiperson_inertial_640_8frames_marker_up_acc_phone.py \
+  --ckpt fusion_gru_8frames_marker_phone.pt \
+  --clip-onnx \
+  --ema-alpha 0.4 --inertia 1

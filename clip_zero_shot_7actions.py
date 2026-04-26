@@ -402,7 +402,7 @@ HAND_GESTURE_SET = {COME_IDX, WAVE_IDX, STOP_IDX, HIGH_WAVE_IDX}
 
 # ── Feature toggles ──────────────────────────────────────────────────
 ENABLE_SMALL_LOVE = True     # Set False to disable small_love detection
-ENABLE_MIDDLE_FINGER = False  # Set False to disable middle_finger detection
+ENABLE_MIDDLE_FINGER = True  # Set False to disable middle_finger detection
 
 # RTMW body keypoint for head reference (nose)
 KP_NOSE = 0
@@ -438,8 +438,9 @@ THUMB_IP_OFF = 2  # thumb interphalangeal joint (PIP equivalent)
 
 
 def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
-                min_score: float = 0.25) -> float | None:
-    """Measure avg distance from hand wrist to fingertips (proxy for depth)."""
+                min_score: float = 0.35) -> float | None:
+    """Measure avg distance from hand wrist to fingertips (proxy for depth).
+    Returns None if hand is not clearly visible."""
     wrist = kpts[hand_base]
     ws = scores[hand_base]
     if ws < min_score:
@@ -449,9 +450,50 @@ def _hand_scale(kpts: np.ndarray, scores: np.ndarray, hand_base: int,
         idx = hand_base + off
         if scores[idx] >= min_score:
             dists.append(np.linalg.norm(kpts[idx] - wrist))
-    if len(dists) < 3:
+    if len(dists) < 4:  # need at least 4 of 5 fingertips visible
         return None
-    return float(np.mean(dists))
+    avg = float(np.mean(dists))
+    if avg < 20.0:  # hand keypoints too clustered → likely hallucinated
+        return None
+    return avg
+
+
+def _hand_is_visible(
+    kpts: np.ndarray, scores: np.ndarray, hand_base: int,
+    min_score: float = 0.35,
+    min_hand_scale_px: float = 24.0,
+) -> bool:
+    """Return True only when RTMW hand keypoints look like a real visible hand.
+
+    This is stricter than a raw wrist/body detection and is used to gate
+    come / wave / stop / small_love so body motion alone cannot trigger them.
+    """
+    wrist = hand_base
+    idx_mcp = hand_base + INDEX_MCP_OFF
+    mid_mcp = hand_base + MIDDLE_MCP_OFF
+    pink_mcp = hand_base + PINKY_MCP_OFF
+    required = [wrist, idx_mcp, mid_mcp, pink_mcp]
+    if any(scores[i] < min_score for i in required):
+        return False
+
+    visible_tips = [hand_base + off for off in FINGERTIP_OFFSETS if scores[hand_base + off] >= min_score]
+    if len(visible_tips) < 4:
+        return False
+
+    hand_sc = _hand_scale(kpts, scores, hand_base, min_score)
+    if hand_sc is None or hand_sc < min_hand_scale_px:
+        return False
+
+    palm_width = float(np.linalg.norm(kpts[pink_mcp] - kpts[idx_mcp]))
+    if palm_width < 12.0:
+        return False
+
+    xs = [float(kpts[i, 0]) for i in required + visible_tips]
+    ys = [float(kpts[i, 1]) for i in required + visible_tips]
+    if (max(xs) - min(xs)) < 18.0 or (max(ys) - min(ys)) < 18.0:
+        return False
+
+    return True
 
 
 def _palm_facing_camera(
@@ -978,7 +1020,11 @@ def main() -> None:
     midfinger_per_person: list[bool] = []   # per-person: middle finger detected this frame
     midfinger_hold_until: list[float] = []  # per-person timestamp until which "middle_finger" is held
     MIDFINGER_HOLD_SEC = 0.5
-    hand_visible: list[bool] = []  # per-person: are hand keypoints visible THIS frame?
+    hand_visible_now: list[bool] = []   # per-person: hand visible in the current frame
+    hand_visible: list[bool] = []       # per-person: hand confirmed visible (rolling)
+    hand_visible_hist: list[deque] = [] # per-person: rolling window of raw hand detections
+    HAND_VISIBLE_WINDOW = 5             # look at last 5 frames
+    HAND_VISIBLE_THRESH = 3             # need 3/5 to confirm hand visible
     # Per-person heart animation state
     anim_type: list[str | None] = []    # None / "love" / "small_love"
     anim_start: list[float] = []        # timestamp when animation started
@@ -1038,7 +1084,11 @@ def main() -> None:
         small_love_hold_until = _resize_list(small_love_hold_until, len(boxes), 0.0)
         midfinger_per_person = _resize_list(midfinger_per_person, len(boxes), False)
         midfinger_hold_until = _resize_list(midfinger_hold_until, len(boxes), 0.0)
+        hand_visible_now = _resize_list(hand_visible_now, len(boxes), False)
         hand_visible = _resize_list(hand_visible, len(boxes), False)
+        while len(hand_visible_hist) < len(boxes):
+            hand_visible_hist.append(deque(maxlen=HAND_VISIBLE_WINDOW))
+        hand_visible_hist = hand_visible_hist[:len(boxes)]
         anim_type = _resize_list(anim_type, len(boxes), None)
         anim_start = _resize_list(anim_start, len(boxes), 0.0)
 
@@ -1050,9 +1100,19 @@ def main() -> None:
                 outs = rtmw_sess.run(rtmw_outs, {rtmw_in: inp})
                 kpts, kscores = rtmw.postprocess(outs, warp)
                 wrist_xy, hbase = _dominant_wrist(kpts, kscores)
-                scale = _hand_scale(kpts, kscores, hbase) if hbase is not None else None
-                palm = _palm_facing_camera(kpts, kscores, hbase) if hbase is not None else None
-                hand_visible[bi] = scale is not None  # hand keypoints visible this frame
+                lh_visible = _hand_is_visible(kpts, kscores, LHAND_BASE)
+                rh_visible = _hand_is_visible(kpts, kscores, RHAND_BASE)
+                dominant_hand_visible = False
+                if hbase == LHAND_BASE:
+                    dominant_hand_visible = lh_visible
+                elif hbase == RHAND_BASE:
+                    dominant_hand_visible = rh_visible
+                scale = _hand_scale(kpts, kscores, hbase) if (hbase is not None and dominant_hand_visible) else None
+                palm = _palm_facing_camera(kpts, kscores, hbase) if (hbase is not None and dominant_hand_visible) else None
+                hand_visible_now[bi] = dominant_hand_visible
+                # Rolling hand visibility: require HAND_VISIBLE_THRESH of last HAND_VISIBLE_WINDOW frames
+                hand_visible_hist[bi].append(hand_visible_now[bi])
+                hand_visible[bi] = hand_visible_now[bi] and sum(hand_visible_hist[bi]) >= HAND_VISIBLE_THRESH
                 wrist_tracker.update(bi, wrist_xy, scale, palm)
                 # Track head (nose) y-coordinate for high_wave detection
                 if kscores[KP_NOSE] >= 0.3:
@@ -1060,8 +1120,8 @@ def main() -> None:
                 else:
                     head_y_per_person[bi] = None
                 # Check both hands for finger-heart (small_love)
-                fh_left = _detect_finger_heart(kpts, kscores, LHAND_BASE)
-                fh_right = _detect_finger_heart(kpts, kscores, RHAND_BASE)
+                fh_left = lh_visible and _detect_finger_heart(kpts, kscores, LHAND_BASE)
+                fh_right = rh_visible and _detect_finger_heart(kpts, kscores, RHAND_BASE)
                 fh_detected = fh_left or fh_right
                 # Only accept if hand is nearly still (low wrist speed)
                 if fh_detected:
@@ -1147,6 +1207,20 @@ def main() -> None:
                     # ── refine stop / wave / come via wrist motion ──
                     now = time.time()
                     for bi_idx in range(len(raw_classes)):
+                        if not hand_visible_now[bi_idx]:
+                            come_hold_until[bi_idx] = 0.0
+                            wave_hold_until[bi_idx] = 0.0
+                            high_wave_hold_until[bi_idx] = 0.0
+                            wave_first_seen[bi_idx] = 0.0
+                            high_wave_first_seen[bi_idx] = 0.0
+                            if raw_classes[bi_idx] in HAND_GESTURE_SET:
+                                raw_classes[bi_idx] = IDLE_IDX
+                            if stable_classes[bi_idx] in HAND_GESTURE_SET:
+                                stable_classes[bi_idx] = IDLE_IDX
+                            if pending_classes[bi_idx] in HAND_GESTURE_SET:
+                                pending_classes[bi_idx] = None
+                                pending_counts[bi_idx] = 0
+
                         # ── 1. Hold check (unconditional – overrides CLIP) ──
                         if ENABLE_MIDDLE_FINGER and now < midfinger_hold_until[bi_idx]:
                             raw_classes[bi_idx] = MIDFINGER_IDX
@@ -1154,13 +1228,14 @@ def main() -> None:
                         if ENABLE_SMALL_LOVE and now < small_love_hold_until[bi_idx]:
                             raw_classes[bi_idx] = SMALL_LOVE_IDX
                             continue
-                        if now < come_hold_until[bi_idx]:
+                        # Hand-gesture hold timers: only fire if hand is still visible
+                        if hand_visible_now[bi_idx] and hand_visible[bi_idx] and now < come_hold_until[bi_idx]:
                             raw_classes[bi_idx] = COME_IDX
                             continue
-                        if now < high_wave_hold_until[bi_idx]:
+                        if hand_visible_now[bi_idx] and hand_visible[bi_idx] and now < high_wave_hold_until[bi_idx]:
                             raw_classes[bi_idx] = HIGH_WAVE_IDX
                             continue
-                        if now < wave_hold_until[bi_idx]:
+                        if hand_visible_now[bi_idx] and hand_visible[bi_idx] and now < wave_hold_until[bi_idx]:
                             raw_classes[bi_idx] = WAVE_IDX
                             continue
 
@@ -1177,9 +1252,9 @@ def main() -> None:
                         # ── 2. Gesture refinement (only for hand-gesture classes) ──
                         cls = raw_classes[bi_idx]
                         if cls is not None and cls in HAND_GESTURE_SET:
-                            # Only accept hand-gesture classes if hand keypoints
-                            # are actually visible in the current frame
-                            if not hand_visible[bi_idx]:
+                            # Require both current-frame hand visibility and
+                            # short-term confirmation to allow hand gestures.
+                            if not hand_visible_now[bi_idx] or not hand_visible[bi_idx]:
                                 raw_classes[bi_idx] = IDLE_IDX
                                 continue
                             bh = boxes[bi_idx][3] - boxes[bi_idx][1]
@@ -1257,7 +1332,9 @@ def main() -> None:
                 small_love_hold_until = []
                 midfinger_per_person = []
                 midfinger_hold_until = []
+                hand_visible_now = []
                 hand_visible = []
+                hand_visible_hist = []
                 anim_type = []
                 anim_start = []
 
