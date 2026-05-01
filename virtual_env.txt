@@ -249,6 +249,45 @@ python3 live_camera_predict_multiperson_inertial_640_8frames_marker_up_acc.py   
 python3 live_camera_predict_multiperson_inertial_640_8frames_marker_up_acc.py   --ckpt fusion_gru_8frames_marker.pt   --camera 0   --ema-alpha 0.4   --inertia 1
 
 
+======================= InternVideo2 offline video labeling =======================
+
+# The previous example used placeholder paths like /path/to/InternVideo.
+# Replace those with your real local paths before running the script.
+
+# 1) Clone InternVideo somewhere on disk.
+git clone https://github.com/OpenGVLab/InternVideo.git ~/InternVideo
+
+# 2) Activate this project environment first, then install the extra dependencies
+# required by InternVideo2 if they are not already present.
+pip install timm einops decord sentencepiece
+
+# 3) Download the InternVideo2 checkpoints you want to use.
+# Then point the script at the real files, for example:
+export INTERNVIDEO2_ROOT=~/InternVideo
+export INTERNVIDEO2_VISION_PRETRAINED=/absolute/path/to/internvideo2_1b_patch14_224.pth
+# Optional full stage-2 checkpoint if you have one:
+# export INTERNVIDEO2_PRETRAINED_PATH=/absolute/path/to/internvideo2_stage2.pt
+
+# 4) Run whole-video quality check + zero-shot labeling.
+python3 label_video_with_quality_gate_by_InternVideo2.py \
+  --video short_videos/raw/come/come_0.mp4 \
+  --labels come,wave,stop,idle,talk_phone,play_phone,thumb_up \
+  --label-definitions-json label_definitions.json \
+  --internvideo2-root "$INTERNVIDEO2_ROOT" \
+  --internvideo2-vision-pretrained "$INTERNVIDEO2_VISION_PRETRAINED" \
+  --output-json qc_and_label_internvideo2.json
+
+# If you also have the stage-2 checkpoint, add:
+#   --internvideo2-pretrained-path "$INTERNVIDEO2_PRETRAINED_PATH"
+
+# Common failure cases:
+# - "Could not find InternVideo2/multi_modality": --internvideo2-root still points
+#   to a placeholder or the wrong folder.
+# - "Label definitions file not found": create label_definitions.json in this repo.
+# - Model init failures usually mean missing InternVideo dependencies or wrong
+#   checkpoint paths.
+
+
 
 
 python3 live_camera_predict_multiperson_inertial_640_8frames_marker_acc.py   --ckpt fusion_gru_8frames_marker.pt --camera 0   --ema-alpha 0.4 --inertia 1
@@ -273,3 +312,97 @@ python3 live_camera_predict_multiperson_inertial_640_8frames_marker_up_acc_phone
   --ckpt fusion_gru_8frames_marker_phone.pt \
   --clip-onnx \
   --ema-alpha 0.4 --inertia 1
+
+
+-------------------------------- Video quality gate + AI labeling ---------------------------
+
+python3 label_video_with_quality_gate.py \
+  --video your_clip.mp4 \
+  --sample-frames 8 \
+  --save-samples-dir qc_samples \
+  --output-json qc_report.json
+
+export GEMINI_API_KEY="your_key_here"
+python3 label_video_with_quality_gate.py \
+  --video your_clip.mp4 \
+  --sample-frames 8 \
+  --provider gemini \
+  --labels come,wave,stop,idle,talk_phone,play_phone \
+  --output-json qc_and_label.json
+
+ollama pull qwen2.5vl
+python3 label_video_with_quality_gate.py \
+  --video your_clip.mp4 \
+  --video-mode windowed \
+  --window-seconds 4 \
+  --window-overlap 0.5 \
+  --sample-frames 8 \
+  --provider ollama \
+  --model qwen2.5vl \
+  --labels come,wave,stop,idle,talk_phone,play_phone \
+  --output-json qc_and_label_ollama.json
+
+export OPENAI_API_KEY="your_key_here"
+python3 label_video_with_quality_gate.py \
+  --images-dir qc_samples \
+  --provider openai \
+  --labels come,wave,stop,idle,talk_phone,play_phone \
+  --output-json qc_and_label.json
+
+
+
+  ollama pull qwen2.5vl
+
+python3 label_video_with_quality_gate.py \
+  --video short_videos/raw/come/come_0.mp4 \
+  --provider ollama \
+  --model qwen2.5vl \
+  --video-mode windowed \
+  --labels come,wave,stop,idle,talk_phone,play_phone,thumb_up \
+  --output-json qc_and_label_ollama.json
+
+
+
+
+
+
+--------------------------------------------------- video encoder 
+InternVideo2 cannot generate labels. It's a contrastive model — it can only score a video against text prompts you provide. It has no text generation capability.
+---------------------------------------------------
+
+  python3 /home/jan/VLM_MLP/label_video_with_quality_gate_by_InternVideo2.py \
+  --video /home/jan/VLM_MLP/short_videos/raw/come/come_0.mp4 \
+  --labels come,wave,stop,idle,talk_phone,play_phone,thumb_up \
+  --label-definitions-json /home/jan/VLM_MLP/label_definitions.json \
+  --internvideo2-root /home/jan/InternVideo \
+  --internvideo2-vision-pretrained "$INTERNVIDEO2_VISION_PRETRAINED" \
+  --internvideo2-num-frames 8 \
+  --output-json /home/jan/VLM_MLP/qc_and_label_internvideo2_8f.json
+
+
+
+  ------------------------
+
+  # Single video
+python3 auto_label_motion.py --video short_videos/raw/come/come_0.mp4
+
+# Batch - all videos
+python3 auto_label_motion.py --videos-glob 'short_videos/raw/**/*.mp4' --output-dir labels/
+
+---------------------------------------------
+
+ python3 auto_label_motion_gemini.py --video short_videos/raw/come/come_0.mp4 --model gemini-2.5-flash
+  Uploading come_0.mp4 (4454 KB)...
+video:       short_videos/raw/come/come_0.mp4
+label:       outward hand push
+description: The person repeatedly moves their right hand from their chest area forward and slightly down, with fingers softly curled, before retracting it back to the chest.
+body_parts:  hands, arms
+confidence:  0.9
+saved:       short_videos/raw/come/come_0.gemini_label.json
+
+
+
+
+python3 auto_label_motion_gemini_with_auto_clip.py \
+  --video mixed_action_videos/record_20260430_172742.mp4 \
+  --model gemini-2.5-flash
